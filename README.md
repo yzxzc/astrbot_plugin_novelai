@@ -1,0 +1,112 @@
+# AstrBot NovelAI Opus API 插件
+
+插件通过 NovelAI 官方图片 API 和 Persistent API Token 生成图片，不需要 Chrome、Playwright、浏览器 Cookie 或账号密码。
+
+Windows 默认从插件数据目录的 `novelai_pat.dpapi` 读取由当前用户 DPAPI 加密的 PAT；Linux、容器和远程服务器通过 `NOVELAI_API_TOKEN` 环境变量提供 PAT。PAT 不得提交到 Git、日志或聊天。
+
+## 安装与凭据
+
+将 [`yzxzc/astrbot_plugin_novelai`](https://github.com/yzxzc/astrbot_plugin_novelai) 克隆或解压到 AstrBot 的 `data/plugins/astrbot_plugin_novelai`，安装依赖后重启 AstrBot。AstrBot WebUI 安装插件时会自动读取 `requirements.txt`。
+
+Windows 安装完成后，在 AstrBot 根目录执行以下命令。脚本使用无回显输入，并把 PAT 通过当前 Windows 用户的 DPAPI 加密后写入插件数据目录：
+
+```powershell
+python data/plugins/astrbot_plugin_novelai/scripts/configure_pat.py
+```
+
+如果插件不位于标准目录，可显式指定 AstrBot 数据目录：
+
+```powershell
+python scripts/configure_pat.py --astrbot-data-dir D:\AstrBot\data
+```
+
+Linux、systemd 和容器不使用 DPAPI。请通过服务环境或密钥管理功能传入变量，并确保变量实际进入 AstrBot 进程：
+
+```bash
+export NOVELAI_API_TOKEN='pst-your-token'
+astrbot run
+```
+
+Docker Compose 示例：
+
+```yaml
+services:
+  astrbot:
+    environment:
+      NOVELAI_API_TOKEN: ${NOVELAI_API_TOKEN}
+```
+
+不要把真实 PAT 写进 `compose.yaml`、`.env`、插件配置、Issue 或日志。发布仓库已通过 `.gitignore` 排除常见凭据和运行数据，但部署者仍应使用平台提供的 Secret 管理能力。
+
+自然语言 Prompt 规划还需要在 AstrBot 中配置一个可用的 LLM Provider，并把 `prompt_planner_provider_id` 改成该 Provider 的实际 ID。没有 DeepSeek Provider 时，可关闭 `prompt_planner_enabled`，现成 NovelAI 标签 Prompt 仍可直接生成。
+
+## 权限
+
+- 私聊 `/nai`、`/nai_status` 只允许 `allowed_sender_ids` 中的 QQ。
+- 群聊默认关闭。开启 `allow_group=true` 后，还必须把群号加入 `allowed_group_ids`。
+- 白名单群内所有成员都可执行普通 `/nai`、`/nai_status` 指令，也可以维护和使用本群共享画师串。
+- 群白名单不会提升成员权限；AstrBot 管理员专属指令仍会单独拒绝普通成员。
+- `bug_report_admin_ids` 默认留空；需要 Bug 反馈私聊通知时，应由部署者自行配置接收者。
+
+## 指令
+
+```text
+/nai help
+/nai_status
+/nai 生成 一位银发蓝眼的成年女性站在雪夜街道，半身，冷色背光
+/nai 重抽
+/nai bug反馈 <问题描述>
+/nai 切换画师串 <串名称>|默认
+/nai 添加画师串 柔和线稿 artist:example, soft lineart
+/nai 画师串
+/nai 查看画师串 柔和线稿
+/nai 负面
+/nai 负面 lowres, extra fingers
+/nai 负面 清空
+/nai 创建人物 霜音 1girl, silver hair, blue eyes, long ponytail, black coat --负面 extra fingers, bad hands
+/nai 确认
+/nai 人物
+/nai 人物 霜音
+/nai 切换大小 竖图
+/nai 切换大小 横图
+/nai 切换大小 方图
+/nai 自定义大小 768x1024
+```
+
+画师串库按群保存并保存在插件数据目录的 `artist_strings.json`，同群成员可以添加、查看、覆盖和使用同一个库。当前画师串按“群号 + QQ 号”绑定，因此成员之间、不同群之间都不会互相切换；使用 `/nai 切换画师串 默认` 可恢复不添加画师串的 NovelAI 默认画风。生成尺寸仍按 QQ 号保存。
+
+`/nai 生成` 会自动区分输入类型：自然语言描述由独立的 `deepseek/deepseek-v4-flash` 规划为 NovelAI V4.5 Prompt；已经包含标签列表、画师字段、权重语法、下划线标签或 `1girl` 等特征的 Prompt 会跳过 DeepSeek 并原样直通。规划调用不带群聊历史，并严格返回 JSON；插件会拒绝无效 JSON、画师字段和多角色编辑器字段。规划器不会要求用户补充年龄或擅自添加 adult。规划完成后，插件才把当前画师串作为前缀拼接；未选择画师串时不添加画师前缀。
+
+当“画师/画家”是画面人物而不是风格名称时，插件会校验并补齐绘画动作、画笔、画布和画架等职业视觉锚点，避免模型只输出 `painter` 或 `beret`。用户明确要求不作画、空手或不带画具时不会强制补齐。
+
+规划器默认使用通用语义展开：简短输入也会围绕主体补全动作或姿态、表情或视线、镜头或构图、环境或道具以及光照氛围。人物库 Prompt 仍由占位符保护，不会被 DeepSeek 改写；补全只发生在人物的本次画面表现上。
+
+`/nai 重抽` 按“群号 + QQ 号”读取上一次成功提交给 NovelAI 的完整 Prompt，跳过 DeepSeek 并原样重新生成。记录包含当时已经拼接的画师串和人物 Prompt，失败请求不会覆盖记录；尺寸使用该用户执行重抽时的当前设置。
+
+`/nai bug反馈 <问题描述>` 会生成形如 `NAI-000001` 的反馈编号，先把提交时间、群号、QQ 和问题描述持久化到插件数据目录的 `bug_reports.json`，再私聊通知 `bug_report_admin_ids`。私聊通知失败不会丢失本地记录。
+
+`/nai 负面` 查看当前 QQ 在当前群的基础负面提示词，`/nai 负面 <内容>` 设置，`/nai 负面 清空` 恢复空白。负面提示词按“QQ + 群/私聊”隔离，不会发送给 DeepSeek，也不会影响同群其他成员。
+
+人物库保存在插件数据目录的 `characters.json`，按群共享。`/nai 创建人物 <角色名> <Prompt> [--负面 <内容>]` 会新建人物或发起同名覆盖确认，角色名必须是无空格的 2–40 个字符；人物 Prompt 不要求任何年龄、性别或人数标记，建议只写稳定身份、外观与服装，不写动作、场景、画师或质量词。可选的 `--负面` 内容会写入 NovelAI V4 对应人物的负面 caption。`/nai 人物` 列出名称，`/nai 人物 <角色名>` 查看完整正面和负面 Prompt。
+
+创建新人物会立即保存。重复提交同名人物时不会立刻覆盖，而是暂存本次新 Prompt，并提示在 60 秒内发送 `/nai 确认`；确认按“群号 + QQ 号”隔离，只能由发起者在原群完成。超时、AstrBot 重启或发起者提交新的创建请求后，旧确认状态失效。确认前若该人物已被其他成员修改，本次确认也会失效，避免覆盖更新后的内容。
+
+生成描述命中已保存角色名时，插件先把名字替换为受保护的 `__NAI_CHARACTER_SLOT_数字__`。DeepSeek 只能围绕槽位规划动作、互动、镜头、环境和光照，并必须原样返回每个槽位一次；插件校验后才把人物 Prompt 原样插回。人物库内容不会发送给 DeepSeek，也不会被翻译、删减、重新加权。默认单次最多命中 4 个不同人物。
+
+规划模型的规范位于 `skills/novelai-prompt-planner`。`prompt_planner_enabled=false` 可恢复原样提交；`prompt_planner_provider_id` 可切换独立规划 Provider。当前默认使用 Flash，以降低 QQ 指令等待时间。即使 NovelAI API 生成是 0 Anlas，DeepSeek Prompt 规划仍按 DeepSeek API 计费。
+
+`/nai_status` 是隐藏诊断指令，不显示在普通 `/nai help` 中；管理员执行帮助时会在私聊管理员列表中看到它。
+
+大小预设对应 NovelAI NORMAL Portrait `832x1216`、Landscape `1216x832` 和 Square `1024x1024`。自定义宽高必须是 64 的倍数、分别位于 64 到 2048 之间，且总像素不得超过 `1024x1024`。插件把当前用户保存的尺寸直接写入每次 API 请求，因此不同 QQ 用户不会互相沿用尺寸。
+
+所有成员执行 `/nai help` 时都会在当前会话显示普通指令。管理员还会额外通过 QQ 私聊收到仅管理员指令。
+
+API 请求固定使用 NAI Diffusion V4.5 Full、Euler Ancestral、Guidance 5、Quality Tags、单张 PNG 和全新随机 Seed。默认 Steps 为 23，Undesired Content 留空，由各 QQ 用户按会话自行设置。发送前必须确认账号是有效 Opus，并强制总像素不超过 1,048,576、Steps 不超过 28、生成数量为 1，且请求不携带任何底图、参考图、Vibe 或 Img2Img 图像数据。
+
+NovelAI API 响应中出现多张图片时，插件按实际像素面积选择最大的候选，并要求最终图片尺寸与请求尺寸一致。无完整主图时会报告错误，不会发送缩略图。
+
+所有生成请求通过单实例队列静默依次执行。Prompt 规划和 API 生成共用同一队列，后发请求不会因为规划响应更快而插队；同一时刻只会有一个 NovelAI 请求。429 默认固定等待 5 秒后重试，最多重试 8 次，不做指数递增。等待期间它继续占用队首，其他本地请求不会插队；超时、5xx 和其他未知错误不会自动重试，以免服务端已生成但客户端重复提交。成功生成只回复图片，规划、认证、网络、HTTP 或图片解析失败时只回复错误信息。
+
+生成结果保存在 `data/plugin_data/astrbot_plugin_novelai/outputs`，Windows PAT 保存在同目录的 `novelai_pat.dpapi`。DPAPI 文件绑定当前 Windows 用户，不能直接复制到其他机器；远程部署应重新配置 `NOVELAI_API_TOKEN`。请勿复制、分享或提交任何 PAT。
+
+群成员使用你的 NovelAI 账号可能涉及第三方使用限制。群功能保持默认关闭，启用前建议核对当前 NovelAI 条款或向官方支持确认。

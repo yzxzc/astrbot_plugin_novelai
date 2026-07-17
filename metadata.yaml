@@ -1,0 +1,9 @@
+name: astrbot_plugin_novelai
+display_name: NovelAI Opus API Generator
+desc: Generate guarded zero-Anlas images through the official NovelAI API and a persistent token.
+author: yzxzc
+version: 3.1.0
+repo: https://github.com/yzxzc/astrbot_plugin_novelai
+astrbot_version: ">=4.26,<5"
+support_platforms:
+  - aiocqhttp
