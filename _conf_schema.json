@@ -45,6 +45,17 @@
     "default": "",
     "hint": "默认留空；群成员通过 /nai 负面 独立设置自己的负面提示词。"
   },
+  "default_artist_string_name": {
+    "description": "全局默认画风名称",
+    "type": "string",
+    "default": "千代noob"
+  },
+  "default_artist_string": {
+    "description": "全局默认画师串",
+    "type": "string",
+    "default": "{artist:mafuyu},artist:ningen mame,artist:kedama milk,artist:wlop,{{artist:chen_bin}},[artist:sho_(sho_lwlw)],[[artist:mignon]], [[[[artist:gaou_(umaiyo_puyoman)]]]]",
+    "hint": "未选择群画师串的用户自动使用；/nai 切换画师串 原生 可关闭。"
+  },
   "max_prompt_length": {
     "description": "Prompt 最大字符数",
     "type": "int",

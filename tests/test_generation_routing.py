@@ -527,3 +527,92 @@ async def test_character_negative_prompt_is_saved_and_resolved(tmp_path: Path) -
         "Prompt：1girl, silver hair, blue eyes\n"
         "负面：extra fingers, bad hands"
     )
+
+
+@pytest.mark.asyncio
+async def test_chibi_planning_keeps_hard_style_and_removes_realism() -> None:
+    """Keep Q-version proportions ahead of ordinary semantic expansion."""
+    plugin = MODULE.NovelAIWebPlugin.__new__(MODULE.NovelAIWebPlugin)
+    plugin.config = {
+        "prompt_planner_enabled": True,
+        "prompt_planner_provider_id": "deepseek/deepseek-v4-flash",
+    }
+    response = Mock(
+        completion_text=(
+            '{"ok":true,"prompt":"1girl, cute, realistic proportions, '
+            'photorealistic, eating ice cream, outdoors",'
+            '"character_prompts":{},"error":null}'
+        )
+    )
+    plugin.context = Mock()
+    plugin.context.llm_generate = AsyncMock(return_value=response)
+
+    plan = await plugin._plan_prompt("Q版女孩正在吃冰淇淋", 4000)
+
+    assert plan["prompt"].startswith("chibi, super deformed, ")
+    assert "realistic proportions" not in plan["prompt"]
+    assert "photorealistic" not in plan["prompt"]
+    system_prompt = plugin.context.llm_generate.await_args.kwargs["system_prompt"]
+    assert "6–14 个紧凑标签" in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_default_artist_and_explicit_original_are_distinct(
+    tmp_path: Path,
+) -> None:
+    """Apply the global snapshot unless the user explicitly chooses original."""
+    plugin = MODULE.NovelAIWebPlugin.__new__(MODULE.NovelAIWebPlugin)
+    plugin.config = {
+        "default_artist_string_name": "千代noob",
+        "default_artist_string": "artist:test,",
+    }
+    plugin._artist_state_lock = asyncio.Lock()
+    plugin._artist_state_path = Mock(return_value=tmp_path / "artist_strings.json")
+    event = CharacterEvent()
+
+    assert await plugin._active_artist_string(event) == ("千代noob", "artist:test")
+
+    await plugin._switch_artist_string(event, "原生")
+    assert await plugin._active_artist_string(event) is None
+
+    await plugin._switch_artist_string(event, "默认")
+    assert await plugin._active_artist_string(event) == ("千代noob", "artist:test")
+
+
+@pytest.mark.asyncio
+async def test_status_reports_queue_and_models_without_generation_lock() -> None:
+    """Expose live local queue state while one request owns the semaphore."""
+    plugin = MODULE.NovelAIWebPlugin.__new__(MODULE.NovelAIWebPlugin)
+    plugin.config = {
+        "steps": 23,
+        "max_total_pixels": 1_048_576,
+        "max_steps": 28,
+        "prompt_planner_provider_id": "deepseek/deepseek-v4-flash",
+    }
+    plugin._check_access = Mock()
+    plugin._user_generation_size = AsyncMock(return_value=(832, 1216))
+    plugin._active_artist_string = AsyncMock(return_value=("千代noob", "artist:test"))
+    plugin._user_negative_prompt = AsyncMock(return_value="")
+    plugin._generation_queue_lock = asyncio.Lock()
+    plugin._generation_queue_size = 3
+    plugin._generation_semaphore = asyncio.Semaphore(0)
+    plugin._read_subscription = AsyncMock(
+        return_value={
+            "active": True,
+            "tier": 3,
+            "trainingStepsLeft": {
+                "fixedTrainingStepsLeft": 9000,
+                "purchasedTrainingSteps": 0,
+            },
+        }
+    )
+
+    results = [result async for result in plugin.generation_status(FakeEvent())]
+
+    assert len(results) == 1
+    status = results[0][1]
+    assert "队列: 生成中 1，等待 2，总计 3" in status
+    assert "Prompt 模型: deepseek/deepseek-v4-flash" in status
+    assert f"绘图模型: {MODULE.NOVELAI_MODEL}" in status
+    assert "当前画风: 千代noob" in status
+    plugin._read_subscription.assert_awaited_once()

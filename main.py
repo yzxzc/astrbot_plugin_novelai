@@ -32,6 +32,17 @@ NOVELAI_PAT_ENV = "NOVELAI_API_TOKEN"
 DEFAULT_STEPS = 23
 DEFAULT_NEGATIVE_PROMPT = ""
 DEFAULT_PROMPT_PLANNER_PROVIDER_ID = "deepseek/deepseek-v4-flash"
+DEFAULT_ARTIST_STRING_NAME = "千代noob"
+DEFAULT_ARTIST_STRING = (
+    "{artist:mafuyu},artist:ningen mame,artist:kedama milk,artist:wlop,"
+    "{{artist:chen_bin}},[artist:sho_(sho_lwlw)],[[artist:mignon]],"
+    " [[[[artist:gaou_(umaiyo_puyoman)]]]]"
+)
+ORIGINAL_ARTIST_STYLE = "__NAI_ORIGINAL_STYLE__"
+CHIBI_SOURCE_PATTERN = re.compile(
+    r"(?:Q版|Ｑ版|q版|chibi|super[\s_-]*deformed)",
+    re.IGNORECASE,
+)
 CHARACTER_SLOT_PATTERN = re.compile(
     r"__NAI_CHARACTER_SLOT_\d+__",
     re.IGNORECASE,
@@ -416,7 +427,7 @@ class NovelAIWebPlugin(star.Star):
                 "/nai 添加画师串 <串名称> <内容> - 保存或覆盖本群画师串",
                 "/nai 画师串 - 列出本群画师串名称",
                 "/nai 查看画师串 <串名称> - 查看画师串详细内容",
-                "/nai 切换画师串 <串名称>|默认 - 切换画师串或恢复默认画风",
+                "/nai 切换画师串 <串名称>|默认|原生 - 切换画师串、全局默认或无画师串",
                 "/nai 负面 - 查看自己的当前负面提示词",
                 "/nai 负面 <内容>|清空 - 设置或清空自己的负面提示词",
                 "/nai 创建人物 <角色名> <Prompt> [--负面 <内容>] - 新建人物或发起覆盖确认",
@@ -710,6 +721,13 @@ class NovelAIWebPlugin(star.Star):
         if not provider_id:
             raise NovelAIWebError("prompt_planner_provider_id 不能为空。")
         system_prompt = self._load_prompt_planner_system_prompt()
+        if CHIBI_SOURCE_PATTERN.search(description):
+            system_prompt += (
+                "\n\n本次输入包含强风格约束 Q版/chibi。必须在主 Prompt 开头保留 "
+                "`chibi, super deformed`；身份、动作和必要场景仍需表达，但使用 "
+                "6–14 个紧凑标签，避免自动补充 realistic proportions、photorealistic、"
+                "tall、long legs 或写实电影镜头等会稀释 Q 版比例的内容。"
+            )
         retry_prompt = description
         last_error: NovelAIWebError | None = None
 
@@ -740,6 +758,34 @@ class NovelAIWebPlugin(star.Star):
                     max_length
                     - sum(len(value) for value in plan["character_prompts"].values()),
                 )
+                if CHIBI_SOURCE_PATTERN.search(description):
+                    prompt_items = [
+                        item.strip()
+                        for item in plan["prompt"].split(",")
+                        if item.strip()
+                    ]
+                    prompt_items = [
+                        item
+                        for item in prompt_items
+                        if item.casefold()
+                        not in {
+                            "chibi",
+                            "super deformed",
+                            "realistic proportions",
+                            "photorealistic",
+                        }
+                    ]
+                    plan["prompt"] = ", ".join(
+                        ("chibi", "super deformed", *prompt_items)
+                    )
+                    if (
+                        len(plan["prompt"])
+                        + sum(
+                            len(value) for value in plan["character_prompts"].values()
+                        )
+                        > max_length
+                    ):
+                        raise NovelAIWebError("Q版风格锁定后的 Prompt 超过长度上限。")
                 semantic_errors = self._semantic_plan_errors(description, plan)
                 if semantic_errors:
                     raise NovelAIWebError(
@@ -833,10 +879,9 @@ class NovelAIWebPlugin(star.Star):
                 if isinstance(raw_active_by_library, dict):
                     for library_key, name in raw_active_by_library.items():
                         library = libraries.get(str(library_key))
-                        if (
-                            library is not None
-                            and isinstance(name, str)
-                            and name in library["presets"]
+                        if isinstance(name, str) and (
+                            name == ORIGINAL_ARTIST_STYLE
+                            or (library is not None and name in library["presets"])
                         ):
                             active_by_library[str(library_key)] = name
                 raw_active = raw_user.get("active", "")
@@ -1782,13 +1827,13 @@ class NovelAIWebPlugin(star.Star):
     ) -> None:
         """Add or replace one artist string in the current shared library."""
         normalized_name = name.strip()
-        normalized_content = content.strip()
+        normalized_content = content.strip(" ,")
         if not normalized_name or len(normalized_name) > 64:
             raise NovelAIWebError("串名称长度必须为 1 到 64 个字符。")
         if re.search(r"\s", normalized_name):
             raise NovelAIWebError("串名称不能包含空格。")
-        if normalized_name == "默认":
-            raise NovelAIWebError("「默认」是保留名称，请使用其他串名称。")
+        if normalized_name in {"默认", "原生", "无"}:
+            raise NovelAIWebError("「默认」「原生」「无」是保留名称。")
         if not normalized_content:
             raise NovelAIWebError("画师串内容不能为空。")
         max_prompt_length = int(self.config.get("max_prompt_length", 4000))
@@ -1813,7 +1858,7 @@ class NovelAIWebPlugin(star.Star):
         """Select one shared artist string for the current QQ user and group."""
         normalized_name = name.strip()
         if not normalized_name or re.search(r"\s", normalized_name):
-            raise NovelAIWebError("用法：/nai 切换画师串 <串名称>|默认")
+            raise NovelAIWebError("用法：/nai 切换画师串 <串名称>|默认|原生")
         sender_id = self._artist_owner_id(event)
         library_key = self._artist_library_key(event)
         async with self._artist_state_lock:
@@ -1823,6 +1868,14 @@ class NovelAIWebPlugin(star.Star):
                 if user_state is not None:
                     user_state["active_by_library"].pop(library_key, None)
                     self._save_artist_state(state)
+                return
+            if normalized_name in {"原生", "无"}:
+                user_state = state["users"].setdefault(
+                    sender_id,
+                    self._new_user_state(),
+                )
+                user_state["active_by_library"][library_key] = ORIGINAL_ARTIST_STYLE
+                self._save_artist_state(state)
                 return
             library = state["libraries"].get(library_key)
             if library is None or normalized_name not in library["presets"]:
@@ -1844,16 +1897,52 @@ class NovelAIWebPlugin(star.Star):
         async with self._artist_state_lock:
             state = self._load_artist_state()
             user_state = state["users"].get(sender_id)
-            if user_state is None:
+            name = (
+                user_state["active_by_library"].get(library_key, "")
+                if user_state is not None
+                else ""
+            )
+            if name == ORIGINAL_ARTIST_STYLE:
                 return None
-            name = user_state["active_by_library"].get(library_key, "")
             if not name:
-                return None
+                default_name = str(
+                    self.config.get(
+                        "default_artist_string_name",
+                        DEFAULT_ARTIST_STRING_NAME,
+                    )
+                ).strip()
+                default_content = str(
+                    self.config.get(
+                        "default_artist_string",
+                        DEFAULT_ARTIST_STRING,
+                    )
+                ).strip(" ,")
+                return (
+                    (default_name or DEFAULT_ARTIST_STRING_NAME, default_content)
+                    if default_content
+                    else None
+                )
             library = state["libraries"].get(library_key)
-            if library is None:
-                return None
-            content = library["presets"].get(name)
-            return (name, content) if content else None
+            content = library["presets"].get(name) if library is not None else None
+            if content:
+                return name, content.strip(" ,")
+            default_name = str(
+                self.config.get(
+                    "default_artist_string_name",
+                    DEFAULT_ARTIST_STRING_NAME,
+                )
+            ).strip()
+            default_content = str(
+                self.config.get(
+                    "default_artist_string",
+                    DEFAULT_ARTIST_STRING,
+                )
+            ).strip(" ,")
+            return (
+                (default_name or DEFAULT_ARTIST_STRING_NAME, default_content)
+                if default_content
+                else None
+            )
 
     async def _artist_string_names_text(self, event: AstrMessageEvent) -> str:
         """List only shared artist-string names and the user's active name."""
@@ -1862,17 +1951,32 @@ class NovelAIWebPlugin(star.Star):
         async with self._artist_state_lock:
             state = self._load_artist_state()
             library = state["libraries"].get(library_key)
-            if library is None or not library["presets"]:
-                return "本群还没有保存画师串。"
             user_state = state["users"].get(sender_id)
             active = (
                 user_state["active_by_library"].get(library_key, "")
                 if user_state is not None
                 else ""
             )
-            names = sorted(library["presets"])
+            names = sorted(library["presets"]) if library is not None else []
 
-        lines = [f"本群画师串（共 {len(names)} 个）"]
+        if active == ORIGINAL_ARTIST_STYLE:
+            active_text = "原生（不添加画师串）"
+        elif active:
+            active_text = active
+        else:
+            active_text = (
+                str(
+                    self.config.get(
+                        "default_artist_string_name",
+                        DEFAULT_ARTIST_STRING_NAME,
+                    )
+                ).strip()
+                or DEFAULT_ARTIST_STRING_NAME
+            )
+        lines = [
+            f"当前画风：{active_text}",
+            f"本群画师串（共 {len(names)} 个）",
+        ]
         for name in names[:50]:
             marker = " [当前]" if name == active else ""
             lines.append(f"- {name}{marker}")
@@ -2101,9 +2205,27 @@ class NovelAIWebPlugin(star.Star):
         try:
             self._check_access(event)
             width, height = await self._user_generation_size(event)
-            async with self._generation_semaphore:
+            selected_artist = await self._active_artist_string(event)
+            negative_prompt = await self._user_negative_prompt(event)
+            async with self._generation_queue_lock:
+                queue_total = self._generation_queue_size
+                queue_active = (
+                    1 if queue_total > 0 and self._generation_semaphore.locked() else 0
+                )
+                queue_waiting = max(0, queue_total - queue_active)
+            subscription_error = ""
+            try:
                 subscription = await self._read_subscription()
+            except NovelAIWebError as exc:
+                subscription = {}
+                subscription_error = str(exc)
             steps = int(self.config.get("steps", DEFAULT_STEPS))
+            planner_provider = str(
+                self.config.get(
+                    "prompt_planner_provider_id",
+                    DEFAULT_PROMPT_PLANNER_PROVIDER_ID,
+                )
+            ).strip()
             active = bool(subscription.get("active", False))
             tier = int(subscription.get("tier", 0))
             training_steps = subscription.get("trainingStepsLeft", {})
@@ -2129,11 +2251,20 @@ class NovelAIWebPlugin(star.Star):
             and steps <= min(int(self.config.get("max_steps", 28)), 28)
         )
         yield event.plain_result(
-            "NovelAI API 状态正常\n"
-            "认证: Persistent API Token\n"
+            (
+                "NovelAI API 状态正常\n"
+                if not subscription_error
+                else f"NovelAI API 状态异常: {subscription_error}\n"
+            )
+            + "认证: Persistent API Token\n"
             f"订阅: {'Opus' if tier == 3 else f'Tier {tier}'}"
             f" ({'有效' if active else '无效'})\n"
             f"Anlas: {balance}（已购 {purchased}）\n"
+            f"队列: 生成中 {queue_active}，等待 {queue_waiting}，总计 {queue_total}\n"
+            f"Prompt 模型: {planner_provider}\n"
+            f"绘图模型: {NOVELAI_MODEL}\n"
+            f"当前画风: {selected_artist[0] if selected_artist else '原生'}\n"
+            f"负面提示词: {negative_prompt or '未设置'}\n"
             f"尺寸: {width}x{height}\n"
             f"Steps: {steps}\n"
             f"免费参数保护: {'通过' if free_eligible else '不通过'}"
@@ -2206,7 +2337,11 @@ class NovelAIWebPlugin(star.Star):
                 yield event.plain_result(str(exc))
                 return
             if arguments.strip() == "默认":
-                yield event.plain_result("已恢复 NovelAI 默认画风（不添加画师串）。")
+                yield event.plain_result(
+                    f"已切换为全局默认画风「{DEFAULT_ARTIST_STRING_NAME}」。"
+                )
+            elif arguments.strip() in {"原生", "无"}:
+                yield event.plain_result("已切换为 NovelAI 原生画风（不添加画师串）。")
             else:
                 yield event.plain_result(
                     f"你的当前画师串已切换为「{arguments.strip()}」。"
