@@ -17,6 +17,20 @@ SPEC.loader.exec_module(MODULE)
 class FakeEvent:
     """Return inspectable results without constructing an AstrBot event."""
 
+    def __init__(self) -> None:
+        """Initialize default pipeline-control flags."""
+        self.is_at_or_wake_command = True
+        self.call_llm = True
+        self.stopped = False
+
+    def should_call_llm(self, call_llm: bool) -> None:
+        """Record whether AstrBot may enter its default chat pipeline."""
+        self.call_llm = call_llm
+
+    def stop_event(self) -> None:
+        """Record that no later handler should process this event."""
+        self.stopped = True
+
     @staticmethod
     def plain_result(text: str) -> tuple[str, str]:
         """Build a fake plain-text result.
@@ -158,6 +172,26 @@ async def test_api_failure_only_returns_error() -> None:
     ]
 
     assert results == [("plain", "生成失败：API unavailable")]
+
+
+@pytest.mark.asyncio
+async def test_malformed_nai_command_never_reaches_default_llm() -> None:
+    """Return one short usage hint for a missing command separator."""
+    plugin = MODULE.NovelAIWebPlugin.__new__(MODULE.NovelAIWebPlugin)
+    plugin._check_access = Mock()
+    event = FakeEvent()
+
+    results = [result async for result in plugin.reject_malformed_nai_command(event)]
+
+    assert event.call_llm is False
+    assert event.stopped is True
+    assert results == [
+        (
+            "plain",
+            "NovelAI 指令格式错误。请使用「/nai <子指令>」，"
+            "例如：/nai 生成 1girl；发送 /nai help 查看帮助。",
+        )
+    ]
 
 
 def test_two_girl_spring_hug_plan_passes_semantic_validation() -> None:

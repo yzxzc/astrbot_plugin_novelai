@@ -2195,6 +2195,29 @@ class NovelAIWebPlugin(star.Star):
                 failed += 1
         return report_id, delivered, failed
 
+    @filter.regex(
+        re.compile(r"^/?nai(?!_status(?:\s|$))(?=\S)", re.IGNORECASE),
+    )
+    async def reject_malformed_nai_command(self, event: AstrMessageEvent):
+        """Stop malformed NovelAI commands before the default chat pipeline.
+
+        Args:
+            event: Message event containing a wake-prefixed but malformed command.
+        """
+        if not event.is_at_or_wake_command:
+            return
+        event.should_call_llm(False)
+        event.stop_event()
+        try:
+            self._check_access(event)
+        except NovelAIWebError as exc:
+            yield event.plain_result(str(exc))
+            return
+        yield event.plain_result(
+            "NovelAI 指令格式错误。请使用「/nai <子指令>」，"
+            "例如：/nai 生成 1girl；发送 /nai help 查看帮助。"
+        )
+
     @filter.command("nai_status")
     async def generation_status(self, event: AstrMessageEvent):
         """Report PAT, subscription, balance, and free-generation guards.
@@ -2202,6 +2225,7 @@ class NovelAIWebPlugin(star.Star):
         Args:
             event: Message event that initiated the command.
         """
+        event.should_call_llm(False)
         try:
             self._check_access(event)
             width, height = await self._user_generation_size(event)
@@ -2278,6 +2302,7 @@ class NovelAIWebPlugin(star.Star):
             event: Message event that initiated the command.
             prompt: Complete text following the ``/nai`` command.
         """
+        event.should_call_llm(False)
         prompt_text = str(prompt).strip()
         if prompt_text.casefold() == "help":
             try:

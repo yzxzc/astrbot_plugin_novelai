@@ -99,6 +99,8 @@ Q版/chibi 等强视觉模式使用精简扩写。Q版请求会确定性保留 `
 
 `/nai_status` 是隐藏诊断指令，不显示在普通 `/nai help` 中；管理员执行帮助时会在私聊管理员列表中看到它。状态会立即显示本地生成中、等待和总队列数，以及 Prompt 规划 Provider、NovelAI 绘图模型、当前画风和负面提示词；订阅查询不占用生成队列。
 
+专用绘图 Bot 建议关闭 AstrBot `provider_settings.enable` 和空白 @ 等待回复。插件通过 `context.llm_generate()` 直接调用配置的 Prompt 规划 Provider，因此关闭默认聊天链路不会关闭 DeepSeek Prompt 规划。`/nai生成`、`/naihelp` 等缺少分隔空格的格式会被插件拦截并返回一行用法提示，不会落入默认聊天模型。
+
 大小预设对应 NovelAI NORMAL Portrait `832x1216`、Landscape `1216x832` 和 Square `1024x1024`。自定义宽高必须是 64 的倍数、分别位于 64 到 2048 之间，且总像素不得超过 `1024x1024`。插件把当前用户保存的尺寸直接写入每次 API 请求，因此不同 QQ 用户不会互相沿用尺寸。
 
 所有成员执行 `/nai help` 时都会在当前会话显示普通指令。管理员还会额外通过 QQ 私聊收到仅管理员指令。
