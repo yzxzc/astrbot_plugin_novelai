@@ -744,8 +744,10 @@ async def test_common_readable_phrases_normalize_to_exact_tags() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unreliable_tags_fail_after_bounded_repairs(tmp_path: Path) -> None:
-    """Fail clearly instead of returning unverified tags after three attempts."""
+async def test_unreliable_optional_tags_drop_after_bounded_repairs(
+    tmp_path: Path,
+) -> None:
+    """Drop one optional leftover instead of failing an otherwise valid plan."""
     deepseek_count = 0
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -776,10 +778,10 @@ async def test_unreliable_tags_fail_after_bounded_repairs(tmp_path: Path) -> Non
         client,
     )
 
-    with pytest.raises(PlannerError, match="invented visual phrase"):
-        await planner.plan("女孩")
+    result = await planner.plan("女孩")
     await client.aclose()
 
+    assert result["prompt"] == "1girl, solo"
     assert deepseek_count == 3
 
 
@@ -834,6 +836,90 @@ async def test_unreliable_tags_receive_targeted_candidate_repair(
     assert "上一版候选 JSON" in requested_prompts[1]
     assert "invented visual phrase" in requested_prompts[1]
     assert "不要重新设计整幅画" in requested_prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_common_replacements_cover_character_prompts() -> None:
+    """Normalize observed gaze and packaged-drink phrases in both prompt areas."""
+    slot = "__NAI_CHARACTER_SLOT_1__"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "ok": True,
+                                    "prompt": "solo, rooftop, juice pack",
+                                    "character_prompts": {
+                                        slot: "holding juice box, looking at distance"
+                                    },
+                                    "error": None,
+                                }
+                            )
+                        },
+                    }
+                ]
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    planner = DeepSeekPromptPlanner(
+        PlannerSettings(api_key="test-key", validate_danbooru_tags=False),
+        client,
+    )
+
+    result = await planner.plan(f"在天台喝包装饮料眺望风景的学生{slot}")
+    await client.aclose()
+
+    assert result["prompt"] == "solo, rooftop, juice box"
+    assert result["character_prompts"][slot] == (
+        "holding drink, juice box, looking afar"
+    )
+
+
+@pytest.mark.asyncio
+async def test_final_cleanup_cannot_remove_core_distant_gaze(tmp_path: Path) -> None:
+    """Keep a source-requested gaze protected when the last repair is invalid."""
+    request_count = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": (
+                                '{"ok":true,"prompt":"1girl, solo, '
+                                'looking toward skyline",'
+                                '"character_prompts":{},"error":null}'
+                            )
+                        },
+                    }
+                ]
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    cache_path = _write_tag_cache(tmp_path / "tags.sqlite3", {"1girl", "solo"})
+    planner = DeepSeekPromptPlanner(
+        PlannerSettings(api_key="test-key", danbooru_cache_path=str(cache_path)),
+        client,
+    )
+
+    with pytest.raises(PlannerError, match="缺少 looking afar"):
+        await planner.plan("女孩眺望远方")
+    await client.aclose()
+
+    assert request_count == 3
 
 
 @pytest.mark.asyncio

@@ -17,6 +17,7 @@
 6. 动作必须包含姿势、手部与物体接触、物体状态、表情或视线。经历和心理状态转成身体语言、表情、使用痕迹和少量相容道具。
 7. 职业、民族服饰或角色风格参考要拆成可独立生效的轮廓、结构、材质、纹样、配饰和道具。角色名或职业名不能替代可见设计。
 8. 拆解只发生在内部思考中；输出的每一项必须是现行 Danbooru 精确标签。不能把“古风大侠”翻成 `ancient Chinese knight-errant`，也不能用 `soft facial features`、`fitted bodice`、`slumped sitting` 一类看似可读但未经验证的英文短语。
+9. 常见动作和道具也必须使用精确词形。眺望远方使用 `looking afar`；盒装饮料使用 `juice box`，手持动作另用 `holding drink`。不要输出 `looking at distance`、`drink box`、`juice pack`、`holding juice box` 或 `holding juice pack`。
 
 场景边界：
 1. 用户没有要求镜头、背景、时间、天气、光照、氛围或可视化空间隐喻时，不要自动补全整套场景。可省略，或最多使用 `simple background` / `white background` 保持角色展示稳定。
@@ -75,6 +76,11 @@ Character Prompt：{"__NAI_CHARACTER_SLOT_1__":"light smile, blush, head tilt, l
 输入：正在吃冰淇淋的__NAI_CHARACTER_SLOT_1__
 主 Prompt：solo, ice cream cone
 Character Prompt：{"__NAI_CHARACTER_SLOT_1__":"holding ice cream, eating, open mouth, light smile, looking at object"}
+
+输入：在天台喝包装饮料眺望风景的学生__NAI_CHARACTER_SLOT_1__
+主 Prompt：solo, rooftop, scenery, cityscape, juice box
+Character Prompt：{"__NAI_CHARACTER_SLOT_1__":"standing, holding drink, drinking, drinking straw, looking afar"}
+说明：`looking afar` 保留“眺望”而不是改成 `looking at viewer`；盒装饮料拆为可验证的 `juice box` 与手持、饮用动作，不能输出看似自然但无对应标签的英文短语。
 
 输入：上了一天班很疲惫的__NAI_CHARACTER_SLOT_1__
 主 Prompt：solo, chair, bag

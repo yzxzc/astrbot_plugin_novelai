@@ -836,6 +836,37 @@ async def test_planning_normalizes_observed_readable_phrases() -> None:
 
 
 @pytest.mark.asyncio
+async def test_plugin_normalizes_gaze_and_drink_character_phrases() -> None:
+    """Apply exact-tag replacements to main and native character prompts."""
+    slot = "__NAI_CHARACTER_SLOT_1__"
+    plugin = MODULE.NovelAIWebPlugin.__new__(MODULE.NovelAIWebPlugin)
+    plugin.config = {
+        "prompt_planner_enabled": True,
+        "prompt_planner_provider_id": "deepseek/deepseek-v4-flash",
+        "validate_danbooru_tags": False,
+    }
+    plugin.context = Mock()
+    plugin.context.llm_generate = AsyncMock(
+        return_value=Mock(
+            completion_text=(
+                '{"ok":true,"prompt":"solo, rooftop, juice pack",'
+                f'"character_prompts":{{"{slot}":'
+                '"holding juice box, looking at distance"},"error":null}'
+            )
+        )
+    )
+
+    plan = await plugin._plan_prompt(
+        f"在天台喝包装饮料眺望风景的学生{slot}",
+        4000,
+        (slot,),
+    )
+
+    assert plan["prompt"] == "solo, rooftop, juice box"
+    assert plan["character_prompts"][slot] == ("holding drink, juice box, looking afar")
+
+
+@pytest.mark.asyncio
 async def test_plugin_repairs_only_invalid_local_tags(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -888,6 +919,47 @@ async def test_plugin_repairs_only_invalid_local_tags(
     assert "不要重新设计整幅画" in repair_prompt
 
 
+@pytest.mark.asyncio
+async def test_plugin_drops_one_optional_invalid_tag_after_repairs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Return a verified plan after three failed repairs of one optional tag."""
+    plugin = MODULE.NovelAIWebPlugin.__new__(MODULE.NovelAIWebPlugin)
+    plugin.config = {
+        "prompt_planner_enabled": True,
+        "prompt_planner_provider_id": "deepseek/deepseek-v4-flash",
+        "validate_danbooru_tags": True,
+        "danbooru_min_post_count": 50,
+    }
+    plugin._danbooru_cache_path = Mock(return_value=Path("tags.sqlite3"))
+    monkeypatch.setattr(MODULE, "read_cache_info", lambda _path: object())
+
+    def fake_lookup(names: set[str], _path: Path):
+        """Treat one controlled optional phrase as absent from the vocabulary."""
+        resolved = {name: name for name in names}
+        metadata = {
+            name: SimpleNamespace(post_count=1_000_000, category=0)
+            for name in names
+            if name != "invented_visual_phrase"
+        }
+        return resolved, metadata
+
+    monkeypatch.setattr(MODULE, "lookup_local_tags", fake_lookup)
+    response = Mock(
+        completion_text=(
+            '{"ok":true,"prompt":"1girl, solo, invented visual phrase",'
+            '"character_prompts":{},"error":null}'
+        )
+    )
+    plugin.context = Mock()
+    plugin.context.llm_generate = AsyncMock(side_effect=[response, response, response])
+
+    plan = await plugin._plan_prompt("女孩", 4000)
+
+    assert plan["prompt"] == "1girl, solo"
+    assert plugin.context.llm_generate.await_count == 3
+
+
 def test_runtime_skill_prioritizes_subject_detail_over_scene_packages() -> None:
     """Keep sparse-input expansion focused on visible character content."""
     system_prompt = MODULE.NovelAIWebPlugin._load_prompt_planner_system_prompt()
@@ -905,6 +977,7 @@ def test_runtime_skill_prioritizes_subject_detail_over_scene_packages() -> None:
     assert "一个主景别或视角" in system_prompt
     assert "普通人物展示、纯心理状态、Q版" in system_prompt
     assert "不得用 `1other` 代替未知性别" in system_prompt
+    assert "眺望远方使用 `looking afar`" in system_prompt
 
 
 def test_runtime_skill_keeps_native_character_caption_contract() -> None:

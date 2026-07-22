@@ -53,7 +53,7 @@
 - `from above`, `from below`, `from side`, `from behind`
 - `low angle`, `high angle`, `dutch angle`
 - `fisheye`, `wide-angle lens`, `foreshortening`
-- `pov`, `looking at viewer`, `looking away`
+- `pov`, `looking at viewer`, `looking away`, `looking afar`
 - `depth of field`, `sharp focus`, `foreground blur`
 
 每次优先选一个主景别和一个主视角。除非用户要求特殊画面，不混用互斥镜头。
@@ -104,5 +104,7 @@
 3. 合并同义项，选择更具体的表达。
 4. 把复杂空间关系拆成多个现行 Danbooru 标签；不保留英文自然语言片段。
 5. 最后按主次顺序重排，而不是照着中文句序逐词翻译。
+
+视线和道具不能用可读英文代替精确标签。“眺望远方”使用 `looking afar`；“盒装饮料”使用 `juice box`，手持动作另用 `holding drink`。不要输出 `looking at distance`、`drink box`、`juice pack` 或合并词 `holding juice box`。
 
 例如“她在雨夜车站等人，心里很失落”可以落实为：单人、站台、雨夜、等待姿态、低垂视线、湿衣、冷色、远景和留白；不要直接把“心里很失落”当作抽象标签堆入。相反，“沉入悲伤之海”已经给出可见空间和动作，应落实为水下、海、下沉、漂浮状态和相容表情，不能按不可见心理活动整体删除。

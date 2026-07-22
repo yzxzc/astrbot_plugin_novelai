@@ -110,6 +110,17 @@ SEMANTIC_ANCHOR_RULES = (
         re.compile(r"ice cream", re.IGNORECASE),
     ),
     (
+        "looking afar",
+        re.compile(
+            r"眺望|远眺|遠眺|望向远方|望向遠方|凝望远方|凝望遠方|"
+            r"遠くを(?:眺|見)|遠方を(?:眺|見)|"
+            r"\b(?:look|looking|gaze|gazing|stare|staring)\b.{0,12}"
+            r"\b(?:afar|into the distance|in the distance|far away)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(r"(?<![a-z])looking afar(?![a-z])", re.IGNORECASE),
+    ),
+    (
         "exhausted",
         re.compile(
             r"疲惫|疲倦|筋疲力尽|燃尽(?:了|后)?|疲れ|疲労|億劫|"
@@ -212,6 +223,17 @@ DANBOORU_COMMON_REPLACEMENTS = {
     "hugging self": ("self hug",),
     "hugging oneself": ("self hug",),
     "holding oneself": ("self hug",),
+    "distant gaze": ("looking afar",),
+    "gazing at distance": ("looking afar",),
+    "gazing into distance": ("looking afar",),
+    "looking at distance": ("looking afar",),
+    "looking far away": ("looking afar",),
+    "looking into distance": ("looking afar",),
+    "drink box": ("juice box",),
+    "holding drink box": ("holding drink", "juice box"),
+    "holding juice box": ("holding drink", "juice box"),
+    "holding juice pack": ("holding drink", "juice box"),
+    "juice pack": ("juice box",),
     "self hugging": ("self hug",),
     "setting sun": ("sunset",),
     "sunset reflection": ("sunset", "reflection"),
@@ -613,6 +635,20 @@ class DeepSeekPromptPlanner:
                             DANBOORU_COMMON_REPLACEMENTS.get(item.casefold(), (item,))
                         )
                 result["prompt"] = ", ".join(dict.fromkeys(prompt_items))
+                for slot, character_prompt in result["character_prompts"].items():
+                    character_items: list[str] = []
+                    for item in character_prompt.split(","):
+                        item = item.strip()
+                        if item:
+                            character_items.extend(
+                                DANBOORU_COMMON_REPLACEMENTS.get(
+                                    item.casefold(),
+                                    (item,),
+                                )
+                            )
+                    result["character_prompts"][slot] = ", ".join(
+                        dict.fromkeys(character_items)
+                    )
                 if CHIBI_SOURCE_PATTERN.search(description):
                     prompt_items = [
                         item.strip()
@@ -658,7 +694,22 @@ class DeepSeekPromptPlanner:
                         "invalid_model_output", "后处理后的 Prompt 超过长度上限。"
                     )
                 if self.settings.validate_danbooru_tags:
-                    await self._validate_danbooru_result(result)
+                    await self._validate_danbooru_result(
+                        result,
+                        drop_invalid=attempt == 2,
+                    )
+                    if attempt == 2:
+                        semantic_errors = self._semantic_plan_errors(
+                            description,
+                            result,
+                        )
+                        if semantic_errors:
+                            raise PlannerError(
+                                "invalid_model_output",
+                                "Prompt 清理无效 tag 后遗漏核心语义："
+                                + "、".join(semantic_errors)
+                                + "。",
+                            )
                 return result
             except PlannerError as exc:
                 last_error = exc
@@ -690,7 +741,11 @@ class DeepSeekPromptPlanner:
             "invalid_model_output", "DeepSeek Prompt 规划失败。"
         )
 
-    async def _validate_danbooru_result(self, result: PlanResult) -> None:
+    async def _validate_danbooru_result(
+        self,
+        result: PlanResult,
+        drop_invalid: bool = False,
+    ) -> None:
         """Reject invented phrases by checking exact Danbooru tag metadata.
 
         NovelAI-specific weighting and V4 interaction prefixes are removed only
@@ -699,6 +754,8 @@ class DeepSeekPromptPlanner:
 
         Args:
             result: Parsed main and character prompts to validate.
+            drop_invalid: Remove at most two non-interaction leftovers instead
+                of failing after the bounded model repair attempts.
 
         Raises:
             PlannerError: If tags are unreliable or Danbooru cannot be checked.
@@ -790,8 +847,37 @@ class DeepSeekPromptPlanner:
             if not valid:
                 invalid_items.extend(candidates[original])
         if invalid_items:
-            shown = "、".join(dict.fromkeys(invalid_items[:20]))
-            suffix = "等" if len(dict.fromkeys(invalid_items)) > 20 else ""
+            unique_items = list(dict.fromkeys(invalid_items))
+            if (
+                drop_invalid
+                and len(unique_items) <= 2
+                and not any(
+                    DANBOORU_INTERACTION_PREFIX_PATTERN.match(item)
+                    for item in unique_items
+                )
+            ):
+                invalid_set = set(unique_items)
+                result["prompt"] = ", ".join(
+                    item.strip()
+                    for item in (result["prompt"] or "").split(",")
+                    if item.strip() and item.strip() not in invalid_set
+                )
+                for slot, character_prompt in result["character_prompts"].items():
+                    result["character_prompts"][slot] = ", ".join(
+                        item.strip()
+                        for item in character_prompt.split(",")
+                        if item.strip() and item.strip() not in invalid_set
+                    )
+                if not result["prompt"] and not any(
+                    result["character_prompts"].values()
+                ):
+                    raise PlannerError(
+                        "invalid_model_output",
+                        "Prompt 的全部内容均未通过本地 Danbooru 词库校验。",
+                    )
+                return
+            shown = "、".join(unique_items[:20])
+            suffix = "等" if len(unique_items) > 20 else ""
             raise PlannerError(
                 "invalid_model_output",
                 "以下内容不在本地可靠 Danbooru 词库中（不存在、作品数过低或为画师标签）："
