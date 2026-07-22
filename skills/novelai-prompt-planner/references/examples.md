@@ -18,6 +18,23 @@
 
 短输入的长度来自服装结构、材质、装饰、姿势和表情，不来自背景、摄影镜头、光影套餐或同义质量词。
 
+## 多语言诗性输入：保留可视化主导意象
+
+输入：
+
+```text
+悲しみの海に沈んだ私
+目を開けるのも億劫
+```
+
+输出：
+
+```text
+solo, underwater, ocean, submerged, sinking, floating, closed eyes, exhausted, depressed, expressionless, floating hair, floating clothes, outstretched arms, bubble, blue theme, wide shot, from above, negative space, darkness, light rays
+```
+
+`私` 不提供性别依据，因此使用 `solo` 并省略性别主体标签。“悲伤之海”和“下沉”是可直接描绘的空间与动作隐喻，必须成为画面结构，不能只剩 `sad, depressed` 或被 `simple background` 覆盖。人物与巨大海洋之间的尺度、深度和方向决定了意象是否成立，因此用一个远景/俯视关系以及少量留白和水下光线表现；不是因为输入“悲伤”就固定附加这些标签。若输入只有“什么都不想做，只想蜷缩着发呆”这类心理与身体状态，则用姿态与表情落实，不凭空发明海、水下、远景或光线。
+
 ## 文化意象：拆成可见设计
 
 输入：
@@ -117,13 +134,13 @@
 主 Prompt：
 
 ```text
-1other, solo, simple background
+solo, simple background
 ```
 
 人物 Prompt：
 
 ```json
-{"__NAI_CHARACTER_SLOT_1__":"other, light smile, blush, head tilt, looking at viewer"}
+{"__NAI_CHARACTER_SLOT_1__":"light smile, blush, head tilt, looking at viewer"}
 ```
 
 人物库已经提供身份、外观和服装，因此动态人物 Prompt 不能另行设计这些固定内容。

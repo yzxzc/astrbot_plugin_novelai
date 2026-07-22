@@ -71,6 +71,8 @@ SEMANTIC_ANCHOR_RULES = (
         "2girls",
         re.compile(
             r"(?:两个|两名|二个|2\s*个|2\s*名)\s*(?:女孩子|女孩|女生|少女)|"
+            r"(?:二人|2人)の?(?:女の子|少女|女子)|"
+            r"(?:女の子|少女|女子)(?:が|は|、|\s)*(?:二人|2人)|"
             r"\b2\s*girls?\b",
             re.IGNORECASE,
         ),
@@ -78,7 +80,11 @@ SEMANTIC_ANCHOR_RULES = (
     ),
     (
         "hugging",
-        re.compile(r"抱在一起|互相拥抱|相拥|拥抱|\bhugg?(?:ing|ed)?\b", re.I),
+        re.compile(
+            r"抱在一起|互相拥抱|相拥|拥抱|抱き合|ハグ|抱擁|"
+            r"\bhugg?(?:ing|ed)?\b",
+            re.I,
+        ),
         re.compile(
             r"(?<![a-z])(?:mutual#|source#|target#)?hug(?:ging)?(?![a-z])|"
             r"\bembrac",
@@ -87,23 +93,129 @@ SEMANTIC_ANCHOR_RULES = (
     ),
     (
         "spring",
-        re.compile(r"春光|春日|春天|春季|\bspring\b", re.IGNORECASE),
+        re.compile(
+            r"春光|春日(?!部)|春天|春季|春に|春の|春らしい|\bspring\b",
+            re.IGNORECASE,
+        ),
         re.compile(r"\bspring\b", re.IGNORECASE),
     ),
     (
         "eating ice cream",
         re.compile(
-            r"(?:吃|舔)\s*(?:着|了|一个)?\s*冰(?:激凌|淇淋)|ice cream",
+            r"(?:吃|舔)\s*(?:着|了|一个)?\s*冰(?:激凌|淇淋)|"
+            r"(?:アイスクリーム|アイス).{0,8}(?:食|舐)|"
+            r"(?:食|舐).{0,8}(?:アイスクリーム|アイス)|ice cream",
             re.IGNORECASE,
         ),
         re.compile(r"ice cream", re.IGNORECASE),
     ),
     (
         "exhausted",
-        re.compile(r"疲惫|疲倦|筋疲力尽|燃尽了|burned? out|exhausted", re.I),
+        re.compile(
+            r"疲惫|疲倦|筋疲力尽|燃尽(?:了|后)?|疲れ|疲労|億劫|"
+            r"burned? out|exhausted",
+            re.I,
+        ),
         re.compile(r"exhausted|tired|fatigue|burned? out", re.IGNORECASE),
     ),
+    (
+        "curled posture",
+        re.compile(
+            r"蜷缩|蜷成一团|抱膝|丸くなって|丸まって|膝を抱|"
+            r"\bcurl(?:ed|ing)? up\b|\bknees to chest\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?:curled up|knees to chest|hugging own legs|fetal position)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "ashes",
+        re.compile(r"灰烬|灰燼|\bashes?\b", re.IGNORECASE),
+        re.compile(r"\b(?:ash|ashes)\b", re.IGNORECASE),
+    ),
+    (
+        "cage",
+        re.compile(
+            r"(?:一座|一个)?(?:铁|牢)(?:笼|籠)|"
+            r"(?:困|关|關|锁|鎖).{0,6}(?:笼|籠)|"
+            r"(?:檻|鳥籠)(?:の中|に|で)|"
+            r"\b(?:inside|in|behind)\s+(?:an?\s+)?(?:iron\s+)?cage\b",
+            re.IGNORECASE,
+        ),
+        re.compile(r"\b(?:cage|behind bars)\b", re.IGNORECASE),
+    ),
+    (
+        "ice",
+        re.compile(
+            r"冰封|冰冻|冻住|(?:困|封|埋).{0,12}(?:冰层|冰塊|冰块|冰中)|"
+            r"(?:冰层|冰塊|冰块|冰中).{0,8}(?:下|困|封|埋)|"
+            r"氷に閉じ込|氷の下|氷漬け|"
+            r"\bencased in ice\b|\btrapped (?:under|in) (?:the )?ice\b",
+            re.IGNORECASE,
+        ),
+        re.compile(r"\b(?:ice|frozen|frost)\b", re.IGNORECASE),
+    ),
 )
+UNDERWATER_SCENE_SOURCE_PATTERN = re.compile(
+    r"(?:"
+    r"(?![^\n]*(?:夕阳|太阳|日落|月亮|船).{0,8}(?:沉入|沉进|下沉|沉没))"
+    r"(?:我|自己|他|她|少年|少女|女孩|男孩|人物|人)"
+    r"(?:正|正在|仿佛|像)?(?:沉入|沉进|下沉|沉没|溺水)"
+    r".{0,10}(?:海|水|深海)|"
+    r"(?:沉入|沉进|下沉|沉没|溺水).{0,10}(?:海|水|深海)"
+    r"(?:中|里|里的|中的)?.{0,3}(?:我|自己|他|她|少年|少女|女孩|男孩|人物|人)|"
+    r"(?![^\n]*(?:夕日|太陽|月|船).{0,8}(?:海|水中|深海)に沈)"
+    r"(?:私|僕|俺|自分|少女|少年|女の子|男の子|人物|人)"
+    r"(?:が|は)?(?:海|水中|深海)に(?:沈|溺)|"
+    r"(?:海|水中|深海)に(?:沈んだ|沈んでいる|沈みゆく|溺れた|溺れている)"
+    r"(?:私|僕|俺|自分|少女|少年|女の子|男の子|人物|人)|"
+    r"(?![^\n]*\b(?:sun|sunset|moon|ship|boat)\b.{0,20}\b(?:sink|sinking|sank|sunk)\b)"
+    r"\b(?:I|person|girl|boy|woman|man|character|figure|subject)\b"
+    r"(?:\s+\b(?:am|is|are|was|were|feel|feels|felt|slowly|being|like)\b){0,3}\s+"
+    r"\b(?:sink|sinking|sank|sunk|submerged|drown(?:ing|ed)?|underwater)\b"
+    r".{0,20}\b(?:sea|ocean|water)\b|"
+    r"\bunderwater\b.{0,20}"
+    r"\b(?:portrait|person|girl|boy|woman|man|character|figure|subject)\b|"
+    r"\b(?:portrait|person|girl|boy|woman|man|character|figure|subject)\b"
+    r".{0,20}\bunderwater\b"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+UNDERWATER_NEGATION_PATTERN = re.compile(
+    r"(?:不要|不含|没有|禁止|排除|去掉|避免)(?:任何)?"
+    r"(?:海|水|水下|水中|溺水)(?:元素|场景)?|"
+    r"(?:水中|海|水)(?:なし|不要|禁止|描かない|入れない|含めない)|"
+    r"\b(?:no|not|without|avoid|exclude)\s+(?:any\s+)?"
+    r"(?:underwater|submerged|drowning|sea|ocean|water)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+EXPLICIT_OTHER_SUBJECT_PATTERN = re.compile(
+    r"(?:非二元|ノンバイナリ|Xジェンダー)|"
+    r"(?:中性|无性别|性别不明|非二元)(?:的)?(?:主体|人物|角色|人)|"
+    r"(?:主体|人物|角色|人).{0,6}(?:中性|无性别|性别不明|非二元)|"
+    r"(?:ジェンダーニュートラル|無性別|性別不詳|ノンバイナリ)(?:な)?"
+    r"(?:人物|人|キャラクター)|"
+    r"\b(?:agender|non[- ]?binary|genderfluid|genderqueer)\b|"
+    r"\b(?:gender[- ]neutral|androgynous|genderless|gender[- ]unknown|"
+    r"non[- ]binary)\b.{0,12}\b(?:person|character|figure|subject)\b|"
+    r"\b(?:person|character|figure|subject)\b.{0,12}"
+    r"\b(?:gender[- ]neutral|androgynous|genderless|gender[- ]unknown|"
+    r"non[- ]binary)\b",
+    re.IGNORECASE,
+)
+DANBOORU_COMMON_REPLACEMENTS = {
+    "ash": ("ashes",),
+    "burnt remains": ("burnt", "debris"),
+    "dark atmosphere": ("dark background",),
+    "hugging self": ("self hug",),
+    "hugging oneself": ("self hug",),
+    "holding oneself": ("self hug",),
+    "self hugging": ("self hug",),
+    "setting sun": ("sunset",),
+    "sunset reflection": ("sunset", "reflection"),
+}
 QUALITY_PATTERN = re.compile(
     r"(?i)(?<![a-z0-9_])(?:masterpiece|best quality|very aesthetic|"
     r"absurdres|amazing quality|highres|score_\d+)(?![a-z0-9_])"
@@ -303,6 +415,12 @@ def parse_planner_response(
             "invalid_model_output", "DeepSeek 没有返回有效 JSON。"
         ) from exc
     expected_fields = {"ok", "prompt", "character_prompts", "error"}
+    if (
+        isinstance(payload, dict)
+        and payload.get("ok") is True
+        and set(payload) == expected_fields - {"error"}
+    ):
+        payload["error"] = None
     if not isinstance(payload, dict) or set(payload) != expected_fields:
         raise PlannerError(
             "invalid_model_output", "DeepSeek 返回了协议外字段或缺少字段。"
@@ -467,6 +585,7 @@ class DeepSeekPromptPlanner:
             )
         retry_prompt = description
         last_error: PlannerError | None = None
+        last_candidate_json = ""
 
         for attempt in range(3):
             try:
@@ -486,6 +605,14 @@ class DeepSeekPromptPlanner:
                     max_length
                     - sum(len(value) for value in result["character_prompts"].values()),
                 )
+                prompt_items: list[str] = []
+                for item in (result["prompt"] or "").split(","):
+                    item = item.strip()
+                    if item:
+                        prompt_items.extend(
+                            DANBOORU_COMMON_REPLACEMENTS.get(item.casefold(), (item,))
+                        )
+                result["prompt"] = ", ".join(dict.fromkeys(prompt_items))
                 if CHIBI_SOURCE_PATTERN.search(description):
                     prompt_items = [
                         item.strip()
@@ -504,6 +631,16 @@ class DeepSeekPromptPlanner:
                         }
                     ]
                     result["prompt"] = ", ".join(("chibi", *prompt_items))
+                last_candidate_json = json.dumps(
+                    {
+                        "ok": True,
+                        "prompt": result["prompt"],
+                        "character_prompts": result["character_prompts"],
+                        "error": None,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
                 semantic_errors = self._semantic_plan_errors(description, result)
                 if semantic_errors:
                     raise PlannerError(
@@ -531,11 +668,24 @@ class DeepSeekPromptPlanner:
                 }:
                     raise
                 if attempt < 2:
-                    retry_prompt = (
-                        f"上一次输出无效：{exc} 请重新规划以下原始描述，"
-                        "逐项保留人数、主体、动作、关系和环境，"
-                        "只返回协议规定的一行 JSON：\n" + description
-                    )
+                    if (
+                        last_candidate_json
+                        and "以下内容不在本地可靠 Danbooru 词库中" in str(exc)
+                    ):
+                        retry_prompt = (
+                            f"上一版候选 JSON：{last_candidate_json}\n"
+                            f"本地精确 tag 校验错误：{exc}\n"
+                            "只替换或删除错误中列出的无效 tag；保留其余有效 tag、"
+                            "人物槽位、核心语义和构图，不要重新设计整幅画。"
+                            "只返回协议规定的一行 JSON。\n原始描述：" + description
+                        )
+                    else:
+                        retry_prompt = (
+                            f"上一次输出无效：{exc} 请重新规划以下原始描述，"
+                            "逐项保留原文语言、人数、主体、动作、关系、环境、"
+                            "主导意象及空间或材质隐喻，"
+                            "只返回协议规定的一行 JSON：\n" + description
+                        )
         raise last_error or PlannerError(
             "invalid_model_output", "DeepSeek Prompt 规划失败。"
         )
@@ -794,13 +944,28 @@ class DeepSeekPromptPlanner:
         hug_is_negated = bool(
             re.search(
                 r"(?:不要|不|没有|禁止|拒绝)\s*(?:互相)?(?:拥抱|抱在一起)|"
+                r"(?:抱き合|ハグ|抱擁).{0,4}(?:ない|ません|禁止)|"
                 r"\b(?:no|not|without)\s+hugg?",
+                description,
+                re.IGNORECASE,
+            )
+        )
+        two_girls_is_negated = bool(
+            re.search(
+                r"(?:二人|2人)の?(?:女の子|少女|女子).{0,6}"
+                r"(?:ではなく|じゃなく|ではない)|"
+                r"(?:不是|并非|不要)\s*(?:两个|两名|2\s*个)\s*(?:女孩|女生|少女)|"
+                r"\bnot\s+(?:two|2)\s+girls?\b",
                 description,
                 re.IGNORECASE,
             )
         )
         errors: list[str] = []
         for name, source_pattern, output_pattern in SEMANTIC_ANCHOR_RULES:
+            if name == "2girls" and two_girls_is_negated:
+                if output_pattern.search(combined_prompt):
+                    errors.append("错误增加 2girls")
+                continue
             if name == "hugging" and hug_is_negated:
                 if output_pattern.search(combined_prompt):
                     errors.append("错误增加 hugging")
@@ -809,8 +974,29 @@ class DeepSeekPromptPlanner:
                 combined_prompt
             ):
                 errors.append(f"缺少 {name}")
+        if UNDERWATER_SCENE_SOURCE_PATTERN.search(
+            description
+        ) and not UNDERWATER_NEGATION_PATTERN.search(description):
+            if not re.search(
+                r"(?<![a-z])(?:underwater|submerged|sinking|drowning)(?![a-z])",
+                combined_prompt,
+                re.IGNORECASE,
+            ):
+                errors.append("缺少 underwater/sinking 水下动作")
+            if not re.search(
+                r"(?<![a-z])(?:ocean|sea|water)(?![a-z])",
+                combined_prompt,
+                re.IGNORECASE,
+            ):
+                errors.append("缺少 ocean/sea 水下环境")
+            if re.search(r"\b(?:simple|white) background\b", combined_prompt, re.I):
+                errors.append("水下意象不能使用 simple background")
+        main_prompt = result["prompt"] or ""
+        if re.search(
+            r"(?<![a-z0-9_])1other(?![a-z0-9_])", main_prompt, re.I
+        ) and not EXPLICIT_OTHER_SUBJECT_PATTERN.search(description):
+            errors.append("不要用 1other 代替未知性别")
         if re.search(r"推倒|\bpush(?:ing|ed)?\s+(?:down|over)\b", description, re.I):
-            main_prompt = result["prompt"] or ""
             if not (
                 re.search(r"\bpush", main_prompt, re.I)
                 and re.search(

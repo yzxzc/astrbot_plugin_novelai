@@ -263,7 +263,6 @@ def test_two_girl_spring_hug_plan_passes_semantic_validation() -> None:
         '{"ok":true,"prompt":"2girls, hugging, outdoors, spring, cherry '
         'blossoms, warm sunlight","character_prompts":{},"error":null}'
     )
-
     plan = MODULE.NovelAIWebPlugin._parse_planner_response(raw_response, 4000)
 
     assert (
@@ -273,6 +272,16 @@ def test_two_girl_spring_hug_plan_passes_semantic_validation() -> None:
         )
         == []
     )
+
+
+def test_planner_parser_tolerates_omitted_null_error() -> None:
+    """Accept a successful Flash response when only the null field is omitted."""
+    plan = MODULE.NovelAIWebPlugin._parse_planner_response(
+        '{"ok":true,"prompt":"1girl, solo","character_prompts":{}}',
+        4000,
+    )
+
+    assert plan == {"prompt": "1girl, solo", "character_prompts": {}}
 
 
 def test_semantic_validation_rejects_painter_hallucination() -> None:
@@ -318,6 +327,148 @@ def test_semantic_validation_respects_negated_hug() -> None:
         description,
         invalid_plan,
     ) == ["错误增加 hugging"]
+
+
+def test_semantic_validation_preserves_japanese_underwater_metaphor() -> None:
+    """Keep a depictable poetic scene instead of returning only mood tags."""
+    description = "悲しみの海に沈んだ私\n目を開けるのも億劫"
+    collapsed_plan = {
+        "prompt": (
+            "1other, solo, sad, depressed, closed eyes, lying, "
+            "hand on face, simple background"
+        ),
+        "character_prompts": {},
+    }
+    repaired_plan = {
+        "prompt": (
+            "solo, underwater, ocean, submerged, sinking, floating, "
+            "closed eyes, exhausted, depressed, expressionless, floating hair, "
+            "blue theme, wide shot, from above, negative space, darkness, "
+            "light rays"
+        ),
+        "character_prompts": {},
+    }
+
+    assert MODULE.NovelAIWebPlugin._semantic_plan_errors(
+        description,
+        collapsed_plan,
+    ) == [
+        "缺少 exhausted",
+        "缺少 underwater/sinking 水下动作",
+        "缺少 ocean/sea 水下环境",
+        "水下意象不能使用 simple background",
+        "不要用 1other 代替未知性别",
+    ]
+    assert (
+        MODULE.NovelAIWebPlugin._semantic_plan_errors(description, repaired_plan) == []
+    )
+
+
+@pytest.mark.parametrize(
+    ("description", "prompt"),
+    [
+        (
+            "海に沈む夕日を見つめる少女",
+            "1girl, solo, ocean, sunset, looking at horizon",
+        ),
+        ("沉静如水的少年，坐在窗边", "1boy, solo, sitting, window"),
+        (
+            "No underwater; ocean-side portrait of a girl.",
+            "1girl, solo, ocean, portrait",
+        ),
+        ("我看着夕阳沉入海面", "solo, sunset, ocean, looking afar"),
+        (
+            "少女は夕日が海に沈むのを見つめる",
+            "1girl, solo, sunset, ocean, looking afar",
+        ),
+        (
+            "A girl watches the sun sink into the ocean.",
+            "1girl, solo, sunset, ocean, looking afar",
+        ),
+    ],
+)
+def test_semantic_validation_avoids_underwater_false_positives(
+    description: str,
+    prompt: str,
+) -> None:
+    """Bind sinking to the depicted person and honor explicit water negation."""
+    assert (
+        MODULE.NovelAIWebPlugin._semantic_plan_errors(
+            description,
+            {"prompt": prompt, "character_prompts": {}},
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "No smile: a girl is underwater in the ocean.",
+        "Without shoes, a girl sinks underwater in the ocean.",
+        "不要鞋子的女孩沉入海水",
+    ],
+)
+def test_plugin_unrelated_negation_keeps_underwater_requirement(
+    description: str,
+) -> None:
+    """Keep water requirements when the negation targets another attribute."""
+    assert MODULE.NovelAIWebPlugin._semantic_plan_errors(
+        description,
+        {
+            "prompt": "1girl, solo, expressionless, simple background",
+            "character_prompts": {},
+        },
+    ) == [
+        "缺少 underwater/sinking 水下动作",
+        "缺少 ocean/sea 水下环境",
+        "水下意象不能使用 simple background",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("description", "prompt"),
+    [
+        ("Nicolas Cage smiles at the viewer.", "1boy, solo, smile"),
+        ("A girl with a frozen smile.", "1girl, solo, frozen smile"),
+        ("They break the ice with a joke.", "2others, laughing"),
+        ("A girl with an ice-cold gaze.", "1girl, solo, expressionless"),
+    ],
+)
+def test_plugin_material_guards_ignore_names_and_idioms(
+    description: str,
+    prompt: str,
+) -> None:
+    """Do not force physical cage or ice tags from names and idioms."""
+    assert (
+        MODULE.NovelAIWebPlugin._semantic_plan_errors(
+            description,
+            {"prompt": prompt, "character_prompts": {}},
+        )
+        == []
+    )
+
+
+def test_semantic_validation_binds_neutrality_to_the_subject() -> None:
+    """Separate a gender-neutral person from a girl's neutral-colored suit."""
+    assert (
+        MODULE.NovelAIWebPlugin._semantic_plan_errors(
+            "One gender-neutral person stands alone.",
+            {"prompt": "1other, solo, standing", "character_prompts": {}},
+        )
+        == []
+    )
+    assert MODULE.NovelAIWebPlugin._semantic_plan_errors(
+        "一个女孩，穿中性色西装",
+        {"prompt": "1other, solo, suit", "character_prompts": {}},
+    ) == ["不要用 1other 代替未知性别"]
+    assert MODULE.NovelAIWebPlugin._semantic_plan_errors(
+        "可爱的__NAI_CHARACTER_SLOT_1__",
+        {
+            "prompt": "1other, solo",
+            "character_prompts": {"__NAI_CHARACTER_SLOT_1__": "light smile"},
+        },
+    ) == ["不要用 1other 代替未知性别"]
 
 
 def test_semantic_validation_requires_complete_push_down_roles() -> None:
@@ -657,6 +808,86 @@ async def test_chibi_planning_keeps_hard_style_and_removes_realism() -> None:
     assert "6–14 个紧凑标签" in system_prompt
 
 
+@pytest.mark.asyncio
+async def test_planning_normalizes_observed_readable_phrases() -> None:
+    """Convert common natural-language near misses before local tag validation."""
+    plugin = MODULE.NovelAIWebPlugin.__new__(MODULE.NovelAIWebPlugin)
+    plugin.config = {
+        "prompt_planner_enabled": True,
+        "prompt_planner_provider_id": "deepseek/deepseek-v4-flash",
+        "validate_danbooru_tags": False,
+    }
+    plugin.context = Mock()
+    plugin.context.llm_generate = AsyncMock(
+        return_value=Mock(
+            completion_text=(
+                '{"ok":true,"prompt":"solo, hugging oneself, hugging self, '
+                'sunset reflection","character_prompts":{}}'
+            )
+        )
+    )
+
+    plan = await plugin._plan_prompt(
+        "A quiet figure contemplating burnt remains",
+        4000,
+    )
+
+    assert plan["prompt"] == "solo, self hug, sunset, reflection"
+
+
+@pytest.mark.asyncio
+async def test_plugin_repairs_only_invalid_local_tags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Carry the previous candidate into a bounded exact-tag repair request."""
+    plugin = MODULE.NovelAIWebPlugin.__new__(MODULE.NovelAIWebPlugin)
+    plugin.config = {
+        "prompt_planner_enabled": True,
+        "prompt_planner_provider_id": "deepseek/deepseek-v4-flash",
+        "validate_danbooru_tags": True,
+        "danbooru_min_post_count": 50,
+    }
+    plugin._danbooru_cache_path = Mock(return_value=Path("tags.sqlite3"))
+    monkeypatch.setattr(MODULE, "read_cache_info", lambda _path: object())
+
+    def fake_lookup(names: set[str], _path: Path):
+        """Treat one controlled phrase as absent from the local vocabulary."""
+        resolved = {name: name for name in names}
+        metadata = {
+            name: SimpleNamespace(post_count=1_000_000, category=0)
+            for name in names
+            if name != "invented_visual_phrase"
+        }
+        return resolved, metadata
+
+    monkeypatch.setattr(MODULE, "lookup_local_tags", fake_lookup)
+    plugin.context = Mock()
+    plugin.context.llm_generate = AsyncMock(
+        side_effect=[
+            Mock(
+                completion_text=(
+                    '{"ok":true,"prompt":"1girl, solo, invented visual phrase",'
+                    '"character_prompts":{},"error":null}'
+                )
+            ),
+            Mock(
+                completion_text=(
+                    '{"ok":true,"prompt":"1girl, solo",'
+                    '"character_prompts":{},"error":null}'
+                )
+            ),
+        ]
+    )
+
+    plan = await plugin._plan_prompt("女孩", 4000)
+
+    assert plan["prompt"] == "1girl, solo"
+    repair_prompt = plugin.context.llm_generate.await_args_list[1].kwargs["prompt"]
+    assert "上一版候选 JSON" in repair_prompt
+    assert "invented visual phrase" in repair_prompt
+    assert "不要重新设计整幅画" in repair_prompt
+
+
 def test_runtime_skill_prioritizes_subject_detail_over_scene_packages() -> None:
     """Keep sparse-input expansion focused on visible character content."""
     system_prompt = MODULE.NovelAIWebPlugin._load_prompt_planner_system_prompt()
@@ -669,6 +900,11 @@ def test_runtime_skill_prioritizes_subject_detail_over_scene_packages() -> None:
     assert "不以标签数量为目标" in system_prompt
     assert "white gloves" not in system_prompt
     assert "pearl earrings" not in system_prompt
+    assert "中文、日文、英文或混合语言" in system_prompt
+    assert "主导意象" in system_prompt
+    assert "一个主景别或视角" in system_prompt
+    assert "普通人物展示、纯心理状态、Q版" in system_prompt
+    assert "不得用 `1other` 代替未知性别" in system_prompt
 
 
 def test_runtime_skill_keeps_native_character_caption_contract() -> None:
