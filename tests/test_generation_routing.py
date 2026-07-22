@@ -2,12 +2,15 @@
 
 import asyncio
 import importlib.util
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 PLUGIN_PATH = Path(__file__).resolve().parents[1] / "main.py"
+sys.path.insert(0, str(PLUGIN_PATH.parent))
 SPEC = importlib.util.spec_from_file_location("novelai_plugin_under_test", PLUGIN_PATH)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -30,6 +33,11 @@ class FakeEvent:
     def stop_event(self) -> None:
         """Record that no later handler should process this event."""
         self.stopped = True
+
+    @staticmethod
+    def get_sender_id() -> str:
+        """Return a stable QQ identifier for state-aware handlers."""
+        return "10001"
 
     @staticmethod
     def plain_result(text: str) -> tuple[str, str]:
@@ -98,6 +106,8 @@ def build_plugin(
     plugin.config = {"max_prompt_length": 4000}
     plugin._generation_semaphore = asyncio.Semaphore(1)
     plugin._check_access = Mock()
+    plugin._reference_image_path = AsyncMock(return_value=None)
+    plugin._tag_reference_image = AsyncMock(return_value=())
     plugin._active_artist_string = AsyncMock(return_value=None)
     plugin._resolve_character_slots = AsyncMock(
         side_effect=lambda _event, prompt: (prompt, []),
@@ -152,6 +162,59 @@ async def test_natural_language_still_uses_planner() -> None:
     plugin._plan_prompt.assert_awaited_once()
     plugin._generate_from_api.assert_awaited_once_with(
         "1girl, eating ice cream, happy",
+        (832, 1216),
+        (),
+        "",
+        (),
+    )
+    assert results == [("image", "generated.png")]
+
+
+@pytest.mark.asyncio
+async def test_attached_image_tags_are_evidence_for_natural_language() -> None:
+    """Combine local image tags with user edits before DeepSeek planning."""
+    plugin = build_plugin("1girl, black hair, red eyes, selfie")
+    plugin._reference_image_path = AsyncMock(return_value=Path("reference.png"))
+    plugin._tag_reference_image = AsyncMock(
+        return_value=("1girl", "black hair", "red eyes", "looking at viewer")
+    )
+
+    results = [
+        result
+        async for result in plugin.generate_image(
+            FakeEvent(),
+            "生成 改成手机自拍风格",
+        )
+    ]
+
+    planner_description = plugin._plan_prompt.await_args.args[0]
+    assert "用户要求：改成手机自拍风格" in planner_description
+    assert (
+        "<reference_image_tags>1girl, black hair, red eyes, looking at viewer"
+        "</reference_image_tags>" in planner_description
+    )
+    plugin._tag_reference_image.assert_awaited_once_with(Path("reference.png"))
+    assert results == [("image", "generated.png")]
+
+
+@pytest.mark.asyncio
+async def test_attached_image_keeps_direct_prompt_out_of_planner() -> None:
+    """Prefix reliable reference tags without rewriting an explicit tag prompt."""
+    plugin = build_plugin()
+    plugin._reference_image_path = AsyncMock(return_value=Path("reference.png"))
+    plugin._tag_reference_image = AsyncMock(return_value=("black hair", "red eyes"))
+
+    results = [
+        result
+        async for result in plugin.generate_image(
+            FakeEvent(),
+            "生成 1girl, solo, holding smartphone",
+        )
+    ]
+
+    plugin._plan_prompt.assert_not_awaited()
+    plugin._generate_from_api.assert_awaited_once_with(
+        "black hair, red eyes, 1girl, solo, holding smartphone",
         (832, 1216),
         (),
         "",
@@ -264,17 +327,17 @@ def test_semantic_validation_requires_complete_push_down_roles() -> None:
         "prompt": "2people, one person pushing another down, falling backward",
         "character_prompts": {
             "__NAI_CHARACTER_SLOT_1__": (
-                "source#push, standing, leaning forward, looking down"
+                "source#pushing, standing, leaning forward, looking down"
             ),
             "__NAI_CHARACTER_SLOT_2__": (
-                "target#push, falling backward, lying on ground, looking up"
+                "target#pushing, falling backward, lying on ground, looking up"
             ),
         },
     }
     invalid_plan = {
         "prompt": "2people, pushing, dynamic pose",
         "character_prompts": {
-            "__NAI_CHARACTER_SLOT_1__": "source#push",
+            "__NAI_CHARACTER_SLOT_1__": "source#pushing",
             "__NAI_CHARACTER_SLOT_2__": "target#falling",
         },
     }
@@ -291,7 +354,7 @@ def test_semantic_validation_requires_complete_push_down_roles() -> None:
         invalid_plan,
     ) == [
         "缺少 push-down 动作结果",
-        "被动人物缺少 target#push",
+        "被动人物缺少 target#pushing",
         "主动人物缺少推人姿态",
     ]
 
@@ -414,6 +477,7 @@ async def test_redraw_reuses_native_character_captions() -> None:
             character_prompts,
             "lowres",
             ("extra fingers", "bad eyes"),
+            (832, 1216),
         ),
     )
     event = FakeEvent()
@@ -433,6 +497,7 @@ async def test_redraw_reuses_native_character_captions() -> None:
         character_prompts,
         "lowres",
         ("extra fingers", "bad eyes"),
+        (832, 1216),
     )
     assert results == [("image", "generated.png")]
 
@@ -570,6 +635,7 @@ async def test_chibi_planning_keeps_hard_style_and_removes_realism() -> None:
     plugin.config = {
         "prompt_planner_enabled": True,
         "prompt_planner_provider_id": "deepseek/deepseek-v4-flash",
+        "validate_danbooru_tags": False,
     }
     response = Mock(
         completion_text=(
@@ -583,11 +649,36 @@ async def test_chibi_planning_keeps_hard_style_and_removes_realism() -> None:
 
     plan = await plugin._plan_prompt("Q版女孩正在吃冰淇淋", 4000)
 
-    assert plan["prompt"].startswith("chibi, super deformed, ")
+    assert plan["prompt"].startswith("chibi, ")
+    assert "super deformed" not in plan["prompt"]
     assert "realistic proportions" not in plan["prompt"]
     assert "photorealistic" not in plan["prompt"]
     system_prompt = plugin.context.llm_generate.await_args.kwargs["system_prompt"]
     assert "6–14 个紧凑标签" in system_prompt
+
+
+def test_runtime_skill_prioritizes_subject_detail_over_scene_packages() -> None:
+    """Keep sparse-input expansion focused on visible character content."""
+    system_prompt = MODULE.NovelAIWebPlugin._load_prompt_planner_system_prompt()
+
+    assert "短或稀疏描述" in system_prompt
+    assert "服装主件、内外层、剪裁、领口、袖型" in system_prompt
+    assert "镜头、背景、时间、天气、复杂光影和氛围不是默认补全项" in (system_prompt)
+    assert "具体描述" in system_prompt
+    assert "API 已启用 `qualityToggle`" in system_prompt
+    assert "不以标签数量为目标" in system_prompt
+    assert "white gloves" not in system_prompt
+    assert "pearl earrings" not in system_prompt
+
+
+def test_runtime_skill_keeps_native_character_caption_contract() -> None:
+    """Document the exact planner keys required by native V4 captions."""
+    system_prompt = MODULE.NovelAIWebPlugin._load_prompt_planner_system_prompt()
+
+    assert '"character_prompts":{}' in system_prompt
+    assert '"__NAI_CHARACTER_SLOT_1__":"该角色本图动态 Prompt"' in system_prompt
+    assert "固定身份、外观和服装" in system_prompt
+    assert "原生 V4 `char_captions`" in system_prompt
 
 
 @pytest.mark.asyncio
@@ -614,6 +705,105 @@ async def test_default_artist_and_explicit_original_are_distinct(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("description", "planned_prompt", "expected"),
+    [
+        ("两个女孩面对面拥抱", "2girls, hugging", (1216, 832)),
+        ("竖图，两个女孩面对面拥抱", "2girls, hugging", (832, 1216)),
+        ("做成头像", "1girl, face focus", (1024, 1024)),
+        ("一个女孩站着", "1girl, solo, standing", (832, 1216)),
+    ],
+)
+async def test_auto_size_uses_bounded_composition_presets(
+    description: str,
+    planned_prompt: str,
+    expected: tuple[int, int],
+) -> None:
+    """Map content cues only to the three guarded NovelAI normal presets."""
+    plugin = MODULE.NovelAIWebPlugin.__new__(MODULE.NovelAIWebPlugin)
+    plugin.config = {"max_total_pixels": 1_048_576}
+    plugin._artist_state_lock = asyncio.Lock()
+    plugin._load_artist_state = Mock(
+        return_value={
+            "version": 7,
+            "libraries": {},
+            "users": {
+                "10001": {
+                    "size_mode": "auto",
+                    "width": 832,
+                    "height": 1216,
+                }
+            },
+        }
+    )
+
+    size = await plugin._user_generation_size(
+        CharacterEvent(),
+        description,
+        planned_prompt,
+    )
+
+    assert size == expected
+
+
+@pytest.mark.asyncio
+async def test_fixed_size_overrides_auto_composition() -> None:
+    """Keep an explicit custom or preset size as the highest priority."""
+    plugin = MODULE.NovelAIWebPlugin.__new__(MODULE.NovelAIWebPlugin)
+    plugin.config = {"max_total_pixels": 1_048_576}
+    plugin._artist_state_lock = asyncio.Lock()
+    plugin._load_artist_state = Mock(
+        return_value={
+            "version": 7,
+            "libraries": {},
+            "users": {
+                "10001": {
+                    "size_mode": "fixed",
+                    "width": 768,
+                    "height": 1024,
+                }
+            },
+        }
+    )
+
+    size = await plugin._user_generation_size(
+        CharacterEvent(),
+        "两个女孩在宽阔战场追逐",
+        "2girls, chasing, wide shot",
+    )
+
+    assert size == (768, 1024)
+
+
+def test_danbooru_validator_rejects_invented_natural_language(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject a fluent English phrase even when model JSON is well formed."""
+    plugin = MODULE.NovelAIWebPlugin.__new__(MODULE.NovelAIWebPlugin)
+    plugin.config = {"danbooru_min_post_count": 50}
+    plugin._danbooru_cache_path = Mock(return_value=Path("tags.sqlite3"))
+
+    def fake_lookup(names: set[str], _path: Path):
+        """Resolve only the two real tags in this controlled vocabulary."""
+        resolved = dict.fromkeys(names)
+        metadata = {
+            "1girl": SimpleNamespace(post_count=1_000_000, category=0),
+            "solo": SimpleNamespace(post_count=1_000_000, category=0),
+        }
+        return resolved, metadata
+
+    monkeypatch.setattr(MODULE, "lookup_local_tags", fake_lookup)
+
+    with pytest.raises(MODULE.NovelAIWebError, match="ancient Chinese knight-errant"):
+        plugin._validate_danbooru_plan(
+            {
+                "prompt": "1girl, solo, ancient Chinese knight-errant",
+                "character_prompts": {},
+            }
+        )
+
+
+@pytest.mark.asyncio
 async def test_status_reports_queue_and_models_without_generation_lock() -> None:
     """Expose live local queue state while one request owns the semaphore."""
     plugin = MODULE.NovelAIWebPlugin.__new__(MODULE.NovelAIWebPlugin)
@@ -627,6 +817,16 @@ async def test_status_reports_queue_and_models_without_generation_lock() -> None
     plugin._user_generation_size = AsyncMock(return_value=(832, 1216))
     plugin._active_artist_string = AsyncMock(return_value=("千代noob", "artist:test"))
     plugin._user_negative_prompt = AsyncMock(return_value="")
+    plugin._artist_state_lock = asyncio.Lock()
+    plugin._load_artist_state = Mock(
+        return_value={
+            "version": 7,
+            "libraries": {},
+            "users": {"10001": {"size_mode": "auto"}},
+        }
+    )
+    plugin._danbooru_cache_path = Mock(return_value=Path("missing-tags.sqlite3"))
+    plugin._tagger_data_dir = Mock(return_value=Path("missing-tagger"))
     plugin._generation_queue_lock = asyncio.Lock()
     plugin._generation_queue_size = 3
     plugin._generation_semaphore = asyncio.Semaphore(0)

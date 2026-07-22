@@ -1,19 +1,81 @@
 # 规划范例
 
-以下范例用于校准结构与信息密度，不是必须逐字复用的模板。
+以下范例用于校准输入密度、内容优先级和信息量，不是固定模板。运行时 API 已启用 `qualityToggle`，输出不包含质量词。
 
-## 单人物与环境
+## 短输入：完成角色本体
 
 输入：
 
 ```text
-一位银发蓝眼的成年女性穿白色长外套，夜晚站在下雪的街道上，冷色，半身镜头，背光。
+可爱的女孩
 ```
 
 输出：
 
 ```text
-1woman, adult, solo, silver hair, blue eyes, white long coat, standing, upper body, snowy street, night, backlighting, rim lighting, blue theme, cold colors, best quality, very aesthetic, absurdres
+1girl, solo, medium hair, wavy hair, layered dress, puffy sleeves, high-waist skirt, pleated skirt, pastel colors, embroidery, bow, buttons, ankle socks, mary janes, light smile, blush, head tilt, looking at viewer, simple background
+```
+
+短输入的长度来自服装结构、材质、装饰、姿势和表情，不来自背景、摄影镜头、光影套餐或同义质量词。
+
+## 文化意象：拆成可见设计
+
+输入：
+
+```text
+苗族少女
+```
+
+输出：
+
+```text
+1girl, solo, headdress, silver jewelry, hair ornament, necklace, bracelet, blue dress, embroidery, pleated skirt, tassel, standing, expressionless, simple background
+```
+
+不要只输出一个文化身份词，也不要把文化身份直译成自造英文短语。拆解为现行 Danbooru tag 后，模型即使不认识专名也能呈现主题。
+
+输入：
+
+```text
+古风大侠少女
+```
+
+输出：
+
+```text
+1girl, solo, hanfu, chinese clothes, long sleeves, wide sleeves, layered skirt, waist sash, hair bun, chinese hairpin, jade (gemstone), pendant, sword, jian (weapon), sword tassel, holding sword, fighting stance, determined, looking ahead, simple background
+```
+
+不能输出 `ancient Chinese knight-errant`。它是概念翻译，不是这里要求的精确 Danbooru tag。
+
+## 具体输入：忠实细化，不扩写场景
+
+输入：
+
+```text
+穿白色礼服的女孩，方领，长袖，裙摆有珍珠
+```
+
+输出：
+
+```text
+1girl, solo, white dress, square neckline, long sleeves, long skirt, layered skirt, pearl, satin
+```
+
+只细化用户已经指定的礼服结构。用户没有要求配饰、姿势、表情、场景、镜头或光照，因此不添加这些内容。
+
+## 用户已指定环境与镜头
+
+输入：
+
+```text
+一位银发蓝眼女性穿白色长外套，夜晚站在下雪的街道上，冷色，半身镜头，背光。
+```
+
+输出：
+
+```text
+1girl, solo, grey hair, blue eyes, white coat, high collar, winter clothes, standing, upper body, snow, street, night, backlighting, blue theme
 ```
 
 ## 动作与低机位
@@ -21,13 +83,13 @@
 输入：
 
 ```text
-成年女剑士从废墟上跃下，披风被风吹起，低机位，动作感强，夕阳。
+女剑士从废墟上跃下，披风被风吹起，低机位，动作感强，夕阳。
 ```
 
 输出：
 
 ```text
-1woman, adult, solo, swordswoman, holding sword, 1.3::jumping down, dynamic pose, foreshortening::, flowing cape, low angle, from below, ruins, sunset, wind, dramatic lighting, motion blur, best quality, very aesthetic, absurdres
+1girl, solo, armor, pauldrons, holding sword, 1.3::jumping::, dynamic pose, foreshortening, cape, from below, ruins, sunset, wind, motion blur
 ```
 
 ## 双人物关系
@@ -35,41 +97,65 @@
 输入：
 
 ```text
-两位成年女性背靠背站在雨中的霓虹街道，一人红发黑外套，一人蓝发白外套，广角全身。
+两位女性背靠背站在雨中的霓虹街道，全身。
 ```
 
 输出：
 
 ```text
-2women, adults, back-to-back, standing, full body, one woman with red hair and a black coat, the other woman with blue hair and a white coat, wide-angle lens, neon street, rain, night, wet pavement, colorful reflections, cinematic lighting, best quality, very aesthetic, absurdres
+2girls, back-to-back, standing, full body, neon lights, street, rain, night, wet, reflection
 ```
 
-## 抽象氛围落地
+## 人物库角色
 
 输入：
 
 ```text
-一个成年旅行者走在巨大空旷的盐湖上，要非常孤独、安静。
+可爱的__NAI_CHARACTER_SLOT_1__
+```
+
+主 Prompt：
+
+```text
+1other, solo, simple background
+```
+
+人物 Prompt：
+
+```json
+{"__NAI_CHARACTER_SLOT_1__":"other, light smile, blush, head tilt, looking at viewer"}
+```
+
+人物库已经提供身份、外观和服装，因此动态人物 Prompt 不能另行设计这些固定内容。
+
+## 强媒介：保持 Q版
+
+输入：
+
+```text
+Q版女孩正在吃冰淇淋
 ```
 
 输出：
 
 ```text
-1adult, solo, traveler, walking, small figure, very wide shot, centered horizon, vast salt flat, distant mountains, negative space, muted colors, soft natural lighting, still atmosphere, best quality, very aesthetic, absurdres
+chibi, 1girl, solo, holding ice cream, ice cream cone, eating, happy, simple background
 ```
+
+不要加入写实身体比例、摄影镜头或复杂光影。
 
 ## 保持极简
 
 输入：
 
 ```text
-1girl，不要给我添加服装和背景，只优化基础质量。
+1girl，不要添加服装、背景、镜头和光影
 ```
 
 输出：
 
 ```text
-1girl, solo, best quality, very aesthetic, absurdres
+1girl, solo
 ```
 
 ## 冲突修正
@@ -80,4 +166,4 @@
 一个人，全身大特写，白天夜景，从上方仰拍。
 ```
 
-不要静默输出互斥标签。若调用方支持错误协议，应返回“镜头与时间约束冲突”；若必须产出，则只按最后一个明确约束解析，并记录内部冲突，不在 Prompt 中同时保留两套互斥词。
+不要静默输出互斥标签。若调用方支持错误协议，应返回 `conflicting_constraints`；若必须产出，则只按最后一个明确约束解析，并记录内部冲突，不在 Prompt 中同时保留两套互斥词。
