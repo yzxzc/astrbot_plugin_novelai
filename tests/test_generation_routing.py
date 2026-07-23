@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -147,6 +148,30 @@ async def test_tag_prompt_bypasses_planner_and_success_only_returns_image() -> N
 
 
 @pytest.mark.asyncio
+async def test_long_mixed_tag_prompt_bypasses_planner() -> None:
+    """Route a dense tag list directly despite one CJK name and Unicode dash."""
+    plugin = build_plugin()
+    prompt = (
+        "零零零, chen bin, white hair, cat tail, white t–shirt, "
+        "heterochromia, red eye, blue eye, looking at viewer, gradient hair"
+    )
+
+    results = [
+        result async for result in plugin.generate_image(FakeEvent(), f"生成 {prompt}")
+    ]
+
+    plugin._plan_prompt.assert_not_awaited()
+    plugin._generate_from_api.assert_awaited_once_with(
+        prompt,
+        (832, 1216),
+        (),
+        "",
+        (),
+    )
+    assert results == [("image", "generated.png")]
+
+
+@pytest.mark.asyncio
 async def test_natural_language_still_uses_planner() -> None:
     """Continue expanding concise natural-language scene requests."""
     plugin = build_plugin("1girl, eating ice cream, happy")
@@ -162,6 +187,30 @@ async def test_natural_language_still_uses_planner() -> None:
     plugin._plan_prompt.assert_awaited_once()
     plugin._generate_from_api.assert_awaited_once_with(
         "1girl, eating ice cream, happy",
+        (832, 1216),
+        (),
+        "",
+        (),
+    )
+    assert results == [("image", "generated.png")]
+
+
+@pytest.mark.asyncio
+async def test_short_mixed_description_still_uses_planner() -> None:
+    """Do not mistake a short comma-separated mixed description for a tag list."""
+    plugin = build_plugin("1girl, solo, rooftop, holding drink")
+
+    results = [
+        result
+        async for result in plugin.generate_image(
+            FakeEvent(),
+            "生成 零零零, 穿着white t–shirt在天台喝饮料",
+        )
+    ]
+
+    plugin._plan_prompt.assert_awaited_once()
+    plugin._generate_from_api.assert_awaited_once_with(
+        "1girl, solo, rooftop, holding drink",
         (832, 1216),
         (),
         "",
@@ -920,10 +969,10 @@ async def test_plugin_repairs_only_invalid_local_tags(
 
 
 @pytest.mark.asyncio
-async def test_plugin_drops_one_optional_invalid_tag_after_repairs(
+async def test_plugin_uses_best_candidate_without_deleting_optional_tag(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Return a verified plan after three failed repairs of one optional tag."""
+    """Keep the best candidate intact after three failed exact-tag repairs."""
     plugin = MODULE.NovelAIWebPlugin.__new__(MODULE.NovelAIWebPlugin)
     plugin.config = {
         "prompt_planner_enabled": True,
@@ -956,7 +1005,105 @@ async def test_plugin_drops_one_optional_invalid_tag_after_repairs(
 
     plan = await plugin._plan_prompt("女孩", 4000)
 
-    assert plan["prompt"] == "1girl, solo"
+    assert plan["prompt"] == "1girl, solo, invented visual phrase"
+    assert plugin.context.llm_generate.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_plugin_uses_highest_hit_candidate_after_three_failed_repairs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Return the semantically valid candidate with the best local tag hit rate."""
+    plugin = MODULE.NovelAIWebPlugin.__new__(MODULE.NovelAIWebPlugin)
+    plugin.config = {
+        "prompt_planner_enabled": True,
+        "prompt_planner_provider_id": "deepseek/deepseek-v4-flash",
+        "validate_danbooru_tags": True,
+        "danbooru_min_post_count": 50,
+    }
+    plugin._danbooru_cache_path = Mock(return_value=Path("tags.sqlite3"))
+    monkeypatch.setattr(MODULE, "read_cache_info", lambda _path: object())
+    valid_names = {"1girl", "solo", "rooftop", "scenery", "juice_box"}
+
+    def fake_lookup(names: set[str], _path: Path):
+        """Resolve all names while returning metadata only for reliable tags."""
+        resolved = {name: name for name in names}
+        metadata = {
+            name: SimpleNamespace(post_count=1_000_000, category=0)
+            for name in names
+            if name in valid_names
+        }
+        return resolved, metadata
+
+    monkeypatch.setattr(MODULE, "lookup_local_tags", fake_lookup)
+    prompts = (
+        "1girl, solo, rooftop, invented one, invented two, invented three",
+        (
+            "1girl, solo, rooftop, scenery, juice box, "
+            "invented one, invented two, invented three"
+        ),
+        "1girl, solo, invented one, invented two, invented three",
+    )
+    plugin.context = Mock()
+    plugin.context.llm_generate = AsyncMock(
+        side_effect=[
+            Mock(
+                completion_text=(
+                    '{"ok":true,"prompt":'
+                    + json.dumps(prompt)
+                    + ',"character_prompts":{},"error":null}'
+                )
+            )
+            for prompt in prompts
+        ]
+    )
+
+    plan = await plugin._plan_prompt("女孩", 4000)
+
+    assert plan["prompt"] == prompts[1]
+    assert plugin.context.llm_generate.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_plugin_never_falls_back_to_invalid_character_interaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep invalid V4 interaction tags as hard failures after all retries."""
+    slot = "__NAI_CHARACTER_SLOT_1__"
+    plugin = MODULE.NovelAIWebPlugin.__new__(MODULE.NovelAIWebPlugin)
+    plugin.config = {
+        "prompt_planner_enabled": True,
+        "prompt_planner_provider_id": "deepseek/deepseek-v4-flash",
+        "validate_danbooru_tags": True,
+        "danbooru_min_post_count": 50,
+    }
+    plugin._danbooru_cache_path = Mock(return_value=Path("tags.sqlite3"))
+    monkeypatch.setattr(MODULE, "read_cache_info", lambda _path: object())
+
+    def fake_lookup(names: set[str], _path: Path):
+        """Resolve names while leaving the invented interaction unavailable."""
+        resolved = {name: name for name in names}
+        metadata = {
+            name: SimpleNamespace(post_count=1_000_000, category=0)
+            for name in names
+            if name != "invented_action"
+        }
+        return resolved, metadata
+
+    monkeypatch.setattr(MODULE, "lookup_local_tags", fake_lookup)
+    response = Mock(
+        completion_text=(
+            '{"ok":true,"prompt":"1girl, solo","character_prompts":{'
+            f'"{slot}":"girl, source#invented action"'
+            '},"error":null}'
+        )
+    )
+    plugin.context = Mock()
+    plugin.context.llm_generate = AsyncMock(side_effect=[response, response, response])
+
+    with pytest.raises(MODULE.NovelAIWebError, match="source#invented action"):
+        await plugin._plan_prompt(f"女孩{slot}", 4000, (slot,))
+
     assert plugin.context.llm_generate.await_count == 3
 
 

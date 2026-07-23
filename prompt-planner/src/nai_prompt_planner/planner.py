@@ -35,6 +35,27 @@ CHARACTER_SLOT_PATTERN = re.compile(
     r"__NAI_CHARACTER_SLOT_\d+__",
     re.IGNORECASE,
 )
+NOVELAI_PROMPT_SIGNAL_PATTERN = re.compile(
+    r"(?:\b(?:artist|character|copyright|series|rating)\s*:|"
+    r"\b\d+(?:girls?|boys?|women|men)\b|"
+    r"\b(?:solo|best quality|very aesthetic|absurdres)\b|"
+    r"[{}\[\]]|::|\b[a-z0-9]+_[a-z0-9_]+\b)",
+    re.IGNORECASE,
+)
+NOVELAI_ASCII_TAG_PATTERN = re.compile(
+    r"[a-z0-9][a-z0-9 _.:+\-'/()\\]*",
+    re.IGNORECASE,
+)
+NOVELAI_TAG_CLASSIFICATION_TRANSLATION = str.maketrans(
+    {
+        "‐": "-",
+        "‑": "-",
+        "‒": "-",
+        "–": "-",
+        "—": "-",
+        "−": "-",
+    }
+)
 CHIBI_SOURCE_PATTERN = re.compile(
     r"(?:Q版|Ｑ版|q版|chibi|super[\s_-]*deformed)",
     re.IGNORECASE,
@@ -263,15 +284,26 @@ class PlanResult(TypedDict):
 class PlannerError(Exception):
     """Describe one safe planner failure without exposing credentials."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        tag_hit_count: int | None = None,
+        tag_total_count: int | None = None,
+    ) -> None:
         """Initialize a categorized planner error.
 
         Args:
             code: Stable machine-readable error code.
             message: Safe user-facing error message.
+            tag_hit_count: Number of locally accepted tags in one candidate.
+            tag_total_count: Number of locally checked tags in one candidate.
         """
         super().__init__(message)
         self.code = code
+        self.tag_hit_count = tag_hit_count
+        self.tag_total_count = tag_total_count
 
 
 @dataclass(frozen=True)
@@ -581,6 +613,32 @@ class DeepSeekPromptPlanner:
             raise PlannerError(
                 "invalid_request", "description 或 max_length 超出允许范围。"
             )
+        required_slots = tuple(
+            dict.fromkeys(CHARACTER_SLOT_PATTERN.findall(description))
+        )
+        prompt_parts = [part.strip() for part in description.split(",") if part.strip()]
+        is_direct_prompt = bool(NOVELAI_PROMPT_SIGNAL_PATTERN.search(description))
+        if not is_direct_prompt and len(prompt_parts) >= 2:
+            normalized_parts = [
+                part.translate(NOVELAI_TAG_CLASSIFICATION_TRANSLATION)
+                for part in prompt_parts
+            ]
+            tag_like_count = sum(
+                bool(len(part) <= 120 and NOVELAI_ASCII_TAG_PATTERN.fullmatch(part))
+                for part in normalized_parts
+            )
+            is_direct_prompt = tag_like_count == len(prompt_parts) or (
+                len(prompt_parts) >= 6 and tag_like_count * 5 >= len(prompt_parts) * 4
+            )
+        if is_direct_prompt:
+            base_prompt = CHARACTER_SLOT_PATTERN.sub("", description)
+            base_prompt = re.sub(r"\s*,\s*,+", ", ", base_prompt).strip(" ,")
+            return {
+                "ok": True,
+                "prompt": base_prompt,
+                "character_prompts": dict.fromkeys(required_slots, ""),
+                "error": None,
+            }
         if not self.settings.api_key:
             raise PlannerError("missing_api_key", "未设置 DEEPSEEK_API_KEY。")
         if self.settings.validate_danbooru_tags:
@@ -594,9 +652,6 @@ class DeepSeekPromptPlanner:
                     "danbooru_cache_missing",
                     "本地 Danbooru 词库不存在或已损坏，请先更新本地词库。",
                 )
-        required_slots = tuple(
-            dict.fromkeys(CHARACTER_SLOT_PATTERN.findall(description))
-        )
         system_prompt = load_system_prompt()
         if CHIBI_SOURCE_PATTERN.search(description):
             system_prompt += (
@@ -608,6 +663,8 @@ class DeepSeekPromptPlanner:
         retry_prompt = description
         last_error: PlannerError | None = None
         last_candidate_json = ""
+        best_danbooru_result: PlanResult | None = None
+        best_danbooru_score: tuple[float, int, int] | None = None
 
         for attempt in range(3):
             try:
@@ -694,22 +751,7 @@ class DeepSeekPromptPlanner:
                         "invalid_model_output", "后处理后的 Prompt 超过长度上限。"
                     )
                 if self.settings.validate_danbooru_tags:
-                    await self._validate_danbooru_result(
-                        result,
-                        drop_invalid=attempt == 2,
-                    )
-                    if attempt == 2:
-                        semantic_errors = self._semantic_plan_errors(
-                            description,
-                            result,
-                        )
-                        if semantic_errors:
-                            raise PlannerError(
-                                "invalid_model_output",
-                                "Prompt 清理无效 tag 后遗漏核心语义："
-                                + "、".join(semantic_errors)
-                                + "。",
-                            )
+                    await self._validate_danbooru_result(result)
                 return result
             except PlannerError as exc:
                 last_error = exc
@@ -718,6 +760,27 @@ class DeepSeekPromptPlanner:
                     "invalid_upstream_response",
                 }:
                     raise
+                if (
+                    exc.tag_hit_count is not None
+                    and exc.tag_total_count
+                    and last_candidate_json
+                ):
+                    candidate_score = (
+                        exc.tag_hit_count / exc.tag_total_count,
+                        exc.tag_hit_count,
+                        attempt,
+                    )
+                    if (
+                        best_danbooru_score is None
+                        or candidate_score > best_danbooru_score
+                    ):
+                        best_danbooru_result = {
+                            "ok": True,
+                            "prompt": result["prompt"],
+                            "character_prompts": dict(result["character_prompts"]),
+                            "error": None,
+                        }
+                        best_danbooru_score = candidate_score
                 if attempt < 2:
                     if (
                         last_candidate_json
@@ -737,6 +800,8 @@ class DeepSeekPromptPlanner:
                             "主导意象及空间或材质隐喻，"
                             "只返回协议规定的一行 JSON：\n" + description
                         )
+        if best_danbooru_result is not None:
+            return best_danbooru_result
         raise last_error or PlannerError(
             "invalid_model_output", "DeepSeek Prompt 规划失败。"
         )
@@ -744,7 +809,6 @@ class DeepSeekPromptPlanner:
     async def _validate_danbooru_result(
         self,
         result: PlanResult,
-        drop_invalid: bool = False,
     ) -> None:
         """Reject invented phrases by checking exact Danbooru tag metadata.
 
@@ -754,13 +818,13 @@ class DeepSeekPromptPlanner:
 
         Args:
             result: Parsed main and character prompts to validate.
-            drop_invalid: Remove at most two non-interaction leftovers instead
-                of failing after the bounded model repair attempts.
 
         Raises:
             PlannerError: If tags are unreliable or Danbooru cannot be checked.
         """
         candidates: dict[str, list[str]] = {}
+        accepted_without_lookup: set[str] = set()
+        interaction_candidate_names: set[str] = set()
         prefixed_main_tags: list[str] = []
         prompt_groups = [(result["prompt"] or "", False)]
         prompt_groups.extend(
@@ -795,6 +859,8 @@ class DeepSeekPromptPlanner:
                         prefixed_main_tags.append(item)
                     lookup_value = lookup_value[interaction_match.end() :].strip()
                 normalized = re.sub(r"\s+", "_", lookup_value.casefold())
+                if interaction_match:
+                    interaction_candidate_names.add(normalized)
                 if not normalized:
                     candidates.setdefault(normalized, []).append(item)
                     continue
@@ -802,11 +868,13 @@ class DeepSeekPromptPlanner:
                     pattern.fullmatch(normalized)
                     for pattern in DANBOORU_NOVELAI_SPECIAL_PATTERNS
                 ):
+                    accepted_without_lookup.add(normalized)
                     continue
                 if (
                     is_character_prompt
                     and normalized in DANBOORU_NOVELAI_CHARACTER_TYPES
                 ):
+                    accepted_without_lookup.add(normalized)
                     continue
                 candidates.setdefault(normalized, []).append(item)
 
@@ -837,6 +905,7 @@ class DeepSeekPromptPlanner:
                 "无法读取本地 Danbooru 词库，请重新更新词库。",
             ) from exc
         invalid_items: list[str] = []
+        invalid_names: set[str] = set()
         for original, resolved_name in resolved.items():
             tag = metadata.get(resolved_name)
             valid = (
@@ -845,43 +914,33 @@ class DeepSeekPromptPlanner:
                 and tag.category != 1
             )
             if not valid:
+                invalid_names.add(original)
                 invalid_items.extend(candidates[original])
         if invalid_items:
             unique_items = list(dict.fromkeys(invalid_items))
-            if (
-                drop_invalid
-                and len(unique_items) <= 2
-                and not any(
-                    DANBOORU_INTERACTION_PREFIX_PATTERN.match(item)
-                    for item in unique_items
-                )
-            ):
-                invalid_set = set(unique_items)
-                result["prompt"] = ", ".join(
-                    item.strip()
-                    for item in (result["prompt"] or "").split(",")
-                    if item.strip() and item.strip() not in invalid_set
-                )
-                for slot, character_prompt in result["character_prompts"].items():
-                    result["character_prompts"][slot] = ", ".join(
-                        item.strip()
-                        for item in character_prompt.split(",")
-                        if item.strip() and item.strip() not in invalid_set
-                    )
-                if not result["prompt"] and not any(
-                    result["character_prompts"].values()
-                ):
-                    raise PlannerError(
-                        "invalid_model_output",
-                        "Prompt 的全部内容均未通过本地 Danbooru 词库校验。",
-                    )
-                return
             shown = "、".join(unique_items[:20])
             suffix = "等" if len(unique_items) > 20 else ""
+            fallback_allowed = not bool(
+                invalid_names.intersection(interaction_candidate_names)
+            )
             raise PlannerError(
                 "invalid_model_output",
                 "以下内容不在本地可靠 Danbooru 词库中（不存在、作品数过低或为画师标签）："
                 f"{shown}{suffix}。请只用现行精确 tag 替换，不要改写原始需求。",
+                tag_hit_count=(
+                    (
+                        len(candidates)
+                        + len(accepted_without_lookup)
+                        - len(invalid_names)
+                    )
+                    if fallback_allowed
+                    else None
+                ),
+                tag_total_count=(
+                    len(candidates) + len(accepted_without_lookup)
+                    if fallback_allowed
+                    else None
+                ),
             )
 
     async def _request_completion(self, system_prompt: str, user_prompt: str) -> str:

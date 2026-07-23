@@ -90,6 +90,16 @@ NOVELAI_ASCII_TAG_PATTERN = re.compile(
     r"[a-z0-9][a-z0-9 _.:+\-'/()\\]*",
     re.IGNORECASE,
 )
+NOVELAI_TAG_CLASSIFICATION_TRANSLATION = str.maketrans(
+    {
+        "‐": "-",
+        "‑": "-",
+        "‒": "-",
+        "–": "-",
+        "—": "-",
+        "−": "-",
+    }
+)
 PAINTER_SUBJECT_PATTERN = re.compile(
     r"(?:画师|画家(?!帽)|(?<![\w:])painter\b)",
     re.IGNORECASE,
@@ -453,6 +463,24 @@ class BugReportState(TypedDict):
 
 class NovelAIWebError(Exception):
     """Represent a safe error message that can be returned to the bot owner."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        tag_hit_count: int | None = None,
+        tag_total_count: int | None = None,
+    ) -> None:
+        """Initialize one safe plugin failure.
+
+        Args:
+            message: User-facing error message.
+            tag_hit_count: Number of locally accepted tags in one candidate.
+            tag_total_count: Number of locally checked tags in one candidate.
+        """
+        super().__init__(message)
+        self.tag_hit_count = tag_hit_count
+        self.tag_total_count = tag_total_count
 
 
 @star.register(
@@ -995,19 +1023,18 @@ class NovelAIWebPlugin(star.Star):
     def _validate_danbooru_plan(
         self,
         plan: PromptPlan,
-        drop_invalid: bool = False,
     ) -> None:
         """Reject model-invented phrases using the plugin-local tag database.
 
         Args:
             plan: Parsed main and per-character prompts.
-            drop_invalid: Remove at most two non-interaction leftovers instead
-                of failing after the bounded model repair attempts.
 
         Raises:
             NovelAIWebError: If syntax, tag metadata, or the local cache is invalid.
         """
         candidates: dict[str, list[str]] = {}
+        accepted_without_lookup: set[str] = set()
+        interaction_candidate_names: set[str] = set()
         prefixed_main_tags: list[str] = []
         prompt_groups = [(plan["prompt"], False)]
         prompt_groups.extend(
@@ -1042,6 +1069,8 @@ class NovelAIWebPlugin(star.Star):
                         prefixed_main_tags.append(item)
                     lookup_value = lookup_value[interaction_match.end() :].strip()
                 normalized = re.sub(r"\s+", "_", lookup_value.casefold())
+                if interaction_match:
+                    interaction_candidate_names.add(normalized)
                 if not normalized:
                     candidates.setdefault(normalized, []).append(item)
                     continue
@@ -1049,11 +1078,13 @@ class NovelAIWebPlugin(star.Star):
                     pattern.fullmatch(normalized)
                     for pattern in DANBOORU_NOVELAI_SPECIAL_PATTERNS
                 ):
+                    accepted_without_lookup.add(normalized)
                     continue
                 if (
                     is_character_prompt
                     and normalized in DANBOORU_NOVELAI_CHARACTER_TYPES
                 ):
+                    accepted_without_lookup.add(normalized)
                     continue
                 candidates.setdefault(normalized, []).append(item)
 
@@ -1089,47 +1120,37 @@ class NovelAIWebPlugin(star.Star):
                 "本地 Danbooru 词库不存在或已损坏，请管理员先执行 /nai 更新词库。"
             ) from exc
         invalid_items: list[str] = []
+        invalid_names: set[str] = set()
         for original, resolved_name in resolved.items():
             tag = metadata.get(resolved_name)
             if tag is None or tag.post_count < minimum_posts or tag.category == 1:
+                invalid_names.add(original)
                 invalid_items.extend(candidates[original])
         if invalid_items:
             unique_items = list(dict.fromkeys(invalid_items))
-            if (
-                drop_invalid
-                and len(unique_items) <= 2
-                and not any(
-                    DANBOORU_INTERACTION_PREFIX_PATTERN.match(item)
-                    for item in unique_items
-                )
-            ):
-                invalid_set = set(unique_items)
-                plan["prompt"] = ", ".join(
-                    item.strip()
-                    for item in plan["prompt"].split(",")
-                    if item.strip() and item.strip() not in invalid_set
-                )
-                for slot, character_prompt in plan["character_prompts"].items():
-                    plan["character_prompts"][slot] = ", ".join(
-                        item.strip()
-                        for item in character_prompt.split(",")
-                        if item.strip() and item.strip() not in invalid_set
-                    )
-                if not plan["prompt"] and not any(plan["character_prompts"].values()):
-                    raise NovelAIWebError(
-                        "Prompt 的全部内容均未通过本地 Danbooru 词库校验。"
-                    )
-                logger.warning(
-                    "Dropped optional invalid planner tags after bounded repairs: %s",
-                    ", ".join(unique_items),
-                )
-                return
             shown = "、".join(unique_items[:20])
             suffix = "等" if len(unique_items) > 20 else ""
+            fallback_allowed = not bool(
+                invalid_names.intersection(interaction_candidate_names)
+            )
             raise NovelAIWebError(
                 "以下内容不在本地可靠 Danbooru 词库中"
                 "（不存在、作品数过低或为画师标签）："
-                f"{shown}{suffix}。请只用现行精确 tag 替换，不要改写原始需求。"
+                f"{shown}{suffix}。请只用现行精确 tag 替换，不要改写原始需求。",
+                tag_hit_count=(
+                    (
+                        len(candidates)
+                        + len(accepted_without_lookup)
+                        - len(invalid_names)
+                    )
+                    if fallback_allowed
+                    else None
+                ),
+                tag_total_count=(
+                    len(candidates) + len(accepted_without_lookup)
+                    if fallback_allowed
+                    else None
+                ),
             )
 
     async def _plan_prompt(
@@ -1186,6 +1207,9 @@ class NovelAIWebPlugin(star.Star):
         retry_prompt = description
         last_error: NovelAIWebError | None = None
         last_candidate_json = ""
+        best_danbooru_plan: PromptPlan | None = None
+        best_danbooru_score: tuple[float, int, int] | None = None
+        best_danbooru_counts = (0, 0)
 
         for attempt in range(3):
             try:
@@ -1280,21 +1304,33 @@ class NovelAIWebPlugin(star.Star):
                         + "。"
                     )
                 if bool(self.config.get("validate_danbooru_tags", True)):
-                    self._validate_danbooru_plan(
-                        plan,
-                        drop_invalid=attempt == 2,
-                    )
-                    if attempt == 2:
-                        semantic_errors = self._semantic_plan_errors(description, plan)
-                        if semantic_errors:
-                            raise NovelAIWebError(
-                                "Prompt 清理无效 tag 后遗漏核心语义："
-                                + "、".join(semantic_errors)
-                                + "。"
-                            )
+                    self._validate_danbooru_plan(plan)
                 return plan
             except NovelAIWebError as exc:
                 last_error = exc
+                if (
+                    exc.tag_hit_count is not None
+                    and exc.tag_total_count
+                    and last_candidate_json
+                ):
+                    candidate_score = (
+                        exc.tag_hit_count / exc.tag_total_count,
+                        exc.tag_hit_count,
+                        attempt,
+                    )
+                    if (
+                        best_danbooru_score is None
+                        or candidate_score > best_danbooru_score
+                    ):
+                        best_danbooru_plan = {
+                            "prompt": plan["prompt"],
+                            "character_prompts": dict(plan["character_prompts"]),
+                        }
+                        best_danbooru_score = candidate_score
+                        best_danbooru_counts = (
+                            exc.tag_hit_count,
+                            exc.tag_total_count,
+                        )
                 if attempt < 2:
                     if (
                         last_candidate_json
@@ -1315,6 +1351,16 @@ class NovelAIWebPlugin(star.Star):
                             "只返回协议规定的一行 JSON：\n" + description
                         )
 
+        if best_danbooru_plan is not None:
+            hit_count, total_count = best_danbooru_counts
+            logger.warning(
+                "Using highest-hit planner candidate after bounded repairs: "
+                "%s/%s tags (%.1f%%).",
+                hit_count,
+                total_count,
+                hit_count / total_count * 100,
+            )
+            return best_danbooru_plan
         raise last_error or NovelAIWebError("Prompt 规划失败。")
 
     async def _reference_image_path(
@@ -3465,9 +3511,16 @@ class NovelAIWebPlugin(star.Star):
         prompt_parts = [part.strip() for part in prompt_text.split(",") if part.strip()]
         is_direct_prompt = bool(NOVELAI_PROMPT_SIGNAL_PATTERN.search(prompt_text))
         if not is_direct_prompt and len(prompt_parts) >= 2:
-            is_direct_prompt = all(
-                len(part) <= 120 and NOVELAI_ASCII_TAG_PATTERN.fullmatch(part)
+            normalized_parts = [
+                part.translate(NOVELAI_TAG_CLASSIFICATION_TRANSLATION)
                 for part in prompt_parts
+            ]
+            tag_like_count = sum(
+                bool(len(part) <= 120 and NOVELAI_ASCII_TAG_PATTERN.fullmatch(part))
+                for part in normalized_parts
+            )
+            is_direct_prompt = tag_like_count == len(prompt_parts) or (
+                len(prompt_parts) >= 6 and tag_like_count * 5 >= len(prompt_parts) * 4
             )
         original_description = prompt_text
 

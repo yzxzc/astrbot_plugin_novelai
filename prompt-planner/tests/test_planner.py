@@ -532,6 +532,31 @@ def test_failure_response_requires_the_exact_protocol() -> None:
 
 
 @pytest.mark.asyncio
+async def test_long_mixed_tag_prompt_bypasses_deepseek() -> None:
+    """Return a dense mixed tag list without requiring API or cache access."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("Direct prompt must not call DeepSeek")
+
+    prompt = (
+        "零零零, chen bin, white hair, cat tail, white t–shirt, "
+        "heterochromia, red eye, blue eye, looking at viewer, gradient hair"
+    )
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    planner = DeepSeekPromptPlanner(PlannerSettings(api_key=""), client)
+
+    result = await planner.plan(prompt)
+    await client.aclose()
+
+    assert result == {
+        "ok": True,
+        "prompt": prompt,
+        "character_prompts": {},
+        "error": None,
+    }
+
+
+@pytest.mark.asyncio
 async def test_deepseek_request_uses_json_mode_and_non_thinking_flash() -> None:
     """Send the low-latency official DeepSeek request shape by default."""
     captured_body: dict[str, object] = {}
@@ -744,10 +769,10 @@ async def test_common_readable_phrases_normalize_to_exact_tags() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unreliable_optional_tags_drop_after_bounded_repairs(
+async def test_unreliable_optional_tags_use_best_candidate_after_bounded_repairs(
     tmp_path: Path,
 ) -> None:
-    """Drop one optional leftover instead of failing an otherwise valid plan."""
+    """Keep the highest-hit candidate instead of deleting its remaining phrase."""
     deepseek_count = 0
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -781,7 +806,112 @@ async def test_unreliable_optional_tags_drop_after_bounded_repairs(
     result = await planner.plan("女孩")
     await client.aclose()
 
-    assert result["prompt"] == "1girl, solo"
+    assert result["prompt"] == "1girl, solo, invented visual phrase"
+    assert deepseek_count == 3
+
+
+@pytest.mark.asyncio
+async def test_highest_hit_candidate_wins_after_three_failed_repairs(
+    tmp_path: Path,
+) -> None:
+    """Return the candidate with the strongest local vocabulary hit rate."""
+    deepseek_count = 0
+    prompts = (
+        "1girl, solo, rooftop, invented one, invented two, invented three",
+        (
+            "1girl, solo, rooftop, scenery, juice box, "
+            "invented one, invented two, invented three"
+        ),
+        "1girl, solo, invented one, invented two, invented three",
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal deepseek_count
+        prompt = prompts[deepseek_count]
+        deepseek_count += 1
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "ok": True,
+                                    "prompt": prompt,
+                                    "character_prompts": {},
+                                    "error": None,
+                                }
+                            )
+                        },
+                    }
+                ]
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    cache_path = _write_tag_cache(
+        tmp_path / "tags.sqlite3",
+        {"1girl", "solo", "rooftop", "scenery", "juice_box"},
+    )
+    planner = DeepSeekPromptPlanner(
+        PlannerSettings(api_key="test-key", danbooru_cache_path=str(cache_path)),
+        client,
+    )
+
+    result = await planner.plan("女孩")
+    await client.aclose()
+
+    assert result["prompt"] == prompts[1]
+    assert deepseek_count == 3
+
+
+@pytest.mark.asyncio
+async def test_invalid_character_interaction_never_uses_hit_rate_fallback(
+    tmp_path: Path,
+) -> None:
+    """Keep an invalid native V4 interaction as a hard planner failure."""
+    deepseek_count = 0
+    slot = "__NAI_CHARACTER_SLOT_1__"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal deepseek_count
+        deepseek_count += 1
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "ok": True,
+                                    "prompt": "1girl, solo",
+                                    "character_prompts": {
+                                        slot: "girl, source#invented action"
+                                    },
+                                    "error": None,
+                                }
+                            )
+                        },
+                    }
+                ]
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    cache_path = _write_tag_cache(tmp_path / "tags.sqlite3", {"1girl", "solo"})
+    planner = DeepSeekPromptPlanner(
+        PlannerSettings(api_key="test-key", danbooru_cache_path=str(cache_path)),
+        client,
+    )
+
+    with pytest.raises(PlannerError, match="source#invented action"):
+        await planner.plan(f"女孩{slot}")
+    await client.aclose()
+
     assert deepseek_count == 3
 
 
