@@ -36,7 +36,7 @@
   "steps": {
     "description": "NovelAI API 生成 Steps",
     "type": "int",
-    "default": 23,
+    "default": 28,
     "hint": "Opus 免费生成不得超过 max_steps。"
   },
   "negative_prompt": {
@@ -72,6 +72,44 @@
     "type": "string",
     "default": "deepseek/deepseek-v4-flash",
     "hint": "与群聊默认模型相互独立；Flash 延迟更低，适合日常 Prompt 规划。"
+  },
+  "validate_danbooru_tags": {
+    "description": "使用本地 Danbooru SQLite 严格校验规划结果",
+    "type": "bool",
+    "default": true,
+    "hint": "生成时只查询本地词库，不会逐请求访问 Danbooru；管理员先执行 /nai 更新词库。"
+  },
+  "danbooru_min_post_count": {
+    "description": "规划结果标签的最低 Danbooru 作品数",
+    "type": "int",
+    "default": 50,
+    "hint": "本地每日快照本身只收录作品数不少于 50 的标签。"
+  },
+  "tagger_general_threshold": {
+    "description": "本地 WD Tagger 普通标签置信度阈值",
+    "type": "float",
+    "default": 0.3,
+    "hint": "WD SwinV2 v3 的折中阈值；降低会增加召回率，也会增加误标。"
+  },
+  "tagger_character_threshold": {
+    "description": "本地 WD Tagger 角色标签置信度阈值",
+    "type": "float",
+    "default": 0.85
+  },
+  "tagger_max_tags": {
+    "description": "单张参考图最多保留的反推标签数",
+    "type": "int",
+    "default": 80
+  },
+  "tagger_max_image_bytes": {
+    "description": "Tagger 输入图片最大字节数",
+    "type": "int",
+    "default": 20971520
+  },
+  "tagger_max_image_pixels": {
+    "description": "Tagger 输入图片最大总像素",
+    "type": "int",
+    "default": 25000000
   },
   "max_character_prompt_length": {
     "description": "单个人物 Prompt 最大字符数",

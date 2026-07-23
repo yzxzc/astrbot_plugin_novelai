@@ -5,51 +5,42 @@
 使用英文逗号分隔的标签序列：
 
 ```text
-1girl, solo, silver hair, blue eyes, white coat, standing, looking at viewer, cowboy shot, snowy street, night, rim lighting, blue theme, best quality, very aesthetic, absurdres
+1girl, solo, silver hair, blue eyes, white coat, standing, looking at viewer, cowboy shot, snowy street, night, rim lighting, blue theme
 ```
 
-高信息量、决定题意的标签放前面；装饰、氛围和质量词放后面。不要在同一 Prompt 中反复添加同义质量词或多个完整质量包。
+高信息量、决定题意的标签放前面；装饰和氛围放后面。运行时 API 已启用 `qualityToggle`，规划器不要重复输出质量词。
 
 ## 2. 权重
 
 资料中大量使用 NAI 4.5 数字权重组：
 
 ```text
-1.3::low angle, looking up::
-0.8::fog, floating particles::
+1.3::from below::, 1.3::looking up::
+0.8::fog::, 0.8::sparkle::
 -1.5::multiple views::
 ```
 
-- `权重::标签或短语::` 控制一组内容，必须成对闭合。
+- `权重::标签::` 控制一个已经验证的标签，必须成对闭合。
 - 大于 1 强化，小于 1 弱化；负值属于强抑制手段，应谨慎使用。
 - 默认只给核心动作、关键构图或容易被模型忽略的道具加权。
 - 优先采用温和范围，例如 `1.1`–`1.4`；只有经过验证的特殊串才使用更极端值。
 - 旧式 `{tag}` / `{{tag}}` 强化和 `[tag]` / `[[tag]]` 弱化在资料中也很常见，但新生成的 V4.5 Prompt 优先使用数字权重，避免混合多套注意力语法和深层嵌套。
 
-## 3. 自然语言片段
+## 3. 严格标签语义
 
-标签无法稳定表达复杂空间关系时，可以加入一句简短、具体、可见的英文描述：
-
-```text
-two adults, back-to-back, one looking left and the other looking right
-```
-
-不要写故事背景、人物心理活动、因果解释或模型无法直接画出的抽象判断。长描述应压缩为主体、动作、空间、环境和视觉效果。
-
-## 4. 质量词
-
-默认使用一个短基线：
+本项目使用严格 Danbooru 标签模式。每个逗号项必须能精确对应到现行、非弃用且有实际作品的 Danbooru tag，或是协议明确允许的 NovelAI 专用语法。抽象概念和复杂关系只能用于内部规划，必须拆成多个可验证的视觉标签：
 
 ```text
-best quality, very aesthetic, absurdres
+2girls, back-to-back, looking away, looking left, looking right
 ```
 
-规则：
+禁止输出自然语言句子、自造复合短语、逐词翻译短语、故事背景、人物心理活动或因果解释。不要因为 V4.5 也能理解自然语言，就把自然语言兼容能力当成 Danbooru tag；本项目选择的是更可控的严格标签契约。
 
-- 不同时叠加多套 `masterpiece / amazing quality / highres / ultra detailed` 变体。
-- 特定媒介或画面风格属于视觉规划，不应伪装成“质量词”。
-- 用户要求原始标签、极简 Prompt 或特定风格测试时，可以完全省略质量基线。
-- 插件会独立拼接画师串；这里不加入画师、年份或合作抑制标签。
+## 4. 质量开关与画师串
+
+当前 AstrBot API 请求固定启用 NovelAI `qualityToggle=true`，因此规划器不输出 `masterpiece`、`best quality`、`very aesthetic`、`absurdres`、`amazing quality`、`highres` 或分数类质量标签。这样把 Prompt 容量留给主体、服装、动作和可见细节，也避免重复质量基线。
+
+特定媒介或画面风格属于视觉规划，不应伪装成质量词。插件还会独立拼接画师串；规划器不加入画师、年份或合作抑制标签。
 
 ## 5. Undesired Content
 

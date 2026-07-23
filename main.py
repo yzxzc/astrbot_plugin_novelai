@@ -8,6 +8,7 @@ import json
 import os
 import re
 import secrets
+import sqlite3
 import zipfile
 from datetime import datetime
 from io import BytesIO
@@ -21,7 +22,33 @@ from PIL import Image, UnidentifiedImageError
 
 from astrbot.api import AstrBotConfig, logger, star
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import Image as MessageImage
+from astrbot.api.message_components import Reply
 from astrbot.core.star.filter.command import GreedyStr
+from astrbot.core.utils.quoted_message import extract_quoted_message_images
+
+try:
+    from .image_tagger import (
+        LocalImageTagger,
+        install_tagger_model,
+        read_tagger_info,
+    )
+    from .tag_cache import (
+        lookup_local_tags,
+        read_cache_info,
+        update_danbooru_cache,
+    )
+except ImportError:
+    from image_tagger import (  # type: ignore[no-redef]
+        LocalImageTagger,
+        install_tagger_model,
+        read_tagger_info,
+    )
+    from tag_cache import (  # type: ignore[no-redef]
+        lookup_local_tags,
+        read_cache_info,
+        update_danbooru_cache,
+    )
 
 PLUGIN_NAME = "astrbot_plugin_novelai"
 NOVELAI_API_BASE_URL = "https://image.novelai.net"
@@ -29,9 +56,10 @@ NOVELAI_IMAGE_ENDPOINT = "/ai/generate-image"
 NOVELAI_SUBSCRIPTION_ENDPOINT = "/user/subscription"
 NOVELAI_MODEL = "nai-diffusion-4-5-full"
 NOVELAI_PAT_ENV = "NOVELAI_API_TOKEN"
-DEFAULT_STEPS = 23
+DEFAULT_STEPS = 28
 DEFAULT_NEGATIVE_PROMPT = ""
 DEFAULT_PROMPT_PLANNER_PROVIDER_ID = "deepseek/deepseek-v4-flash"
+DEFAULT_DANBOORU_MIN_POST_COUNT = 50
 DEFAULT_ARTIST_STRING_NAME = "千代noob"
 DEFAULT_ARTIST_STRING = (
     "{artist:mafuyu},artist:ningen mame,artist:kedama milk,artist:wlop,"
@@ -62,6 +90,16 @@ NOVELAI_ASCII_TAG_PATTERN = re.compile(
     r"[a-z0-9][a-z0-9 _.:+\-'/()\\]*",
     re.IGNORECASE,
 )
+NOVELAI_TAG_CLASSIFICATION_TRANSLATION = str.maketrans(
+    {
+        "‐": "-",
+        "‑": "-",
+        "‒": "-",
+        "–": "-",
+        "—": "-",
+        "−": "-",
+    }
+)
 PAINTER_SUBJECT_PATTERN = re.compile(
     r"(?:画师|画家(?!帽)|(?<![\w:])painter\b)",
     re.IGNORECASE,
@@ -78,10 +116,9 @@ PAINTER_NEGATION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 PAINTER_VISUAL_ANCHOR_GROUPS = (
-    ("painter", ("painter",)),
     (
         "drawing (action)",
-        ("drawing", "drawing (action)", "painting", "painting (action)"),
+        ("drawing (action)", "painting (action)"),
     ),
     (
         "holding paintbrush",
@@ -94,14 +131,21 @@ SEMANTIC_ANCHOR_RULES = (
     (
         "2girls",
         re.compile(
-            r"(?:两个|两名|二个|2\s*个|2\s*名)\s*(?:女孩子|女孩|女生|少女)|\b2\s*girls?\b",
+            r"(?:两个|两名|二个|2\s*个|2\s*名)\s*(?:女孩子|女孩|女生|少女)|"
+            r"(?:二人|2人)の?(?:女の子|少女|女子)|"
+            r"(?:女の子|少女|女子)(?:が|は|、|\s)*(?:二人|2人)|"
+            r"\b2\s*girls?\b",
             re.IGNORECASE,
         ),
         re.compile(r"\b(?:2girls|two girls)\b", re.IGNORECASE),
     ),
     (
         "hugging",
-        re.compile(r"抱在一起|互相拥抱|相拥|拥抱|\bhugg?(?:ing|ed)?\b", re.IGNORECASE),
+        re.compile(
+            r"抱在一起|互相拥抱|相拥|拥抱|抱き合|ハグ|抱擁|"
+            r"\bhugg?(?:ing|ed)?\b",
+            re.IGNORECASE,
+        ),
         re.compile(
             r"(?<![a-z])(?:mutual#|source#|target#)?hug(?:ging)?(?![a-z])|\bembrac",
             re.IGNORECASE,
@@ -109,22 +153,151 @@ SEMANTIC_ANCHOR_RULES = (
     ),
     (
         "spring",
-        re.compile(r"春光|春日|春天|春季|\bspring\b", re.IGNORECASE),
+        re.compile(
+            r"春光|春日(?!部)|春天|春季|春に|春の|春らしい|\bspring\b",
+            re.IGNORECASE,
+        ),
         re.compile(r"\bspring\b", re.IGNORECASE),
     ),
     (
         "eating ice cream",
         re.compile(
-            r"(?:吃|舔)\s*(?:着|了|一个)?\s*冰(?:激凌|淇淋)|ice cream", re.IGNORECASE
+            r"(?:吃|舔)\s*(?:着|了|一个)?\s*冰(?:激凌|淇淋)|"
+            r"(?:アイスクリーム|アイス).{0,8}(?:食|舐)|"
+            r"(?:食|舐).{0,8}(?:アイスクリーム|アイス)|ice cream",
+            re.IGNORECASE,
         ),
         re.compile(r"ice cream", re.IGNORECASE),
     ),
     (
+        "looking afar",
+        re.compile(
+            r"眺望|远眺|遠眺|望向远方|望向遠方|凝望远方|凝望遠方|"
+            r"遠くを(?:眺|見)|遠方を(?:眺|見)|"
+            r"\b(?:look|looking|gaze|gazing|stare|staring)\b.{0,12}"
+            r"\b(?:afar|into the distance|in the distance|far away)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(r"(?<![a-z])looking afar(?![a-z])", re.IGNORECASE),
+    ),
+    (
         "exhausted",
-        re.compile(r"疲惫|疲倦|筋疲力尽|燃尽了|burned? out|exhausted", re.IGNORECASE),
+        re.compile(
+            r"疲惫|疲倦|筋疲力尽|燃尽(?:了|后)?|疲れ|疲労|億劫|"
+            r"burned? out|exhausted",
+            re.IGNORECASE,
+        ),
         re.compile(r"exhausted|tired|fatigue|burned? out", re.IGNORECASE),
     ),
+    (
+        "curled posture",
+        re.compile(
+            r"蜷缩|蜷成一团|抱膝|丸くなって|丸まって|膝を抱|"
+            r"\bcurl(?:ed|ing)? up\b|\bknees to chest\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?:curled up|knees to chest|hugging own legs|fetal position)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "ashes",
+        re.compile(r"灰烬|灰燼|\bashes?\b", re.IGNORECASE),
+        re.compile(r"\b(?:ash|ashes)\b", re.IGNORECASE),
+    ),
+    (
+        "cage",
+        re.compile(
+            r"(?:一座|一个)?(?:铁|牢)(?:笼|籠)|"
+            r"(?:困|关|關|锁|鎖).{0,6}(?:笼|籠)|"
+            r"(?:檻|鳥籠)(?:の中|に|で)|"
+            r"\b(?:inside|in|behind)\s+(?:an?\s+)?(?:iron\s+)?cage\b",
+            re.IGNORECASE,
+        ),
+        re.compile(r"\b(?:cage|behind bars)\b", re.IGNORECASE),
+    ),
+    (
+        "ice",
+        re.compile(
+            r"冰封|冰冻|冻住|(?:困|封|埋).{0,12}(?:冰层|冰塊|冰块|冰中)|"
+            r"(?:冰层|冰塊|冰块|冰中).{0,8}(?:下|困|封|埋)|"
+            r"氷に閉じ込|氷の下|氷漬け|"
+            r"\bencased in ice\b|\btrapped (?:under|in) (?:the )?ice\b",
+            re.IGNORECASE,
+        ),
+        re.compile(r"\b(?:ice|frozen|frost)\b", re.IGNORECASE),
+    ),
 )
+UNDERWATER_SCENE_SOURCE_PATTERN = re.compile(
+    r"(?:"
+    r"(?![^\n]*(?:夕阳|太阳|日落|月亮|船).{0,8}(?:沉入|沉进|下沉|沉没))"
+    r"(?:我|自己|他|她|少年|少女|女孩|男孩|人物|人)"
+    r"(?:正|正在|仿佛|像)?(?:沉入|沉进|下沉|沉没|溺水)"
+    r".{0,10}(?:海|水|深海)|"
+    r"(?:沉入|沉进|下沉|沉没|溺水).{0,10}(?:海|水|深海)"
+    r"(?:中|里|里的|中的)?.{0,3}(?:我|自己|他|她|少年|少女|女孩|男孩|人物|人)|"
+    r"(?![^\n]*(?:夕日|太陽|月|船).{0,8}(?:海|水中|深海)に沈)"
+    r"(?:私|僕|俺|自分|少女|少年|女の子|男の子|人物|人)"
+    r"(?:が|は)?(?:海|水中|深海)に(?:沈|溺)|"
+    r"(?:海|水中|深海)に(?:沈んだ|沈んでいる|沈みゆく|溺れた|溺れている)"
+    r"(?:私|僕|俺|自分|少女|少年|女の子|男の子|人物|人)|"
+    r"(?![^\n]*\b(?:sun|sunset|moon|ship|boat)\b.{0,20}\b(?:sink|sinking|sank|sunk)\b)"
+    r"\b(?:I|person|girl|boy|woman|man|character|figure|subject)\b"
+    r"(?:\s+\b(?:am|is|are|was|were|feel|feels|felt|slowly|being|like)\b){0,3}\s+"
+    r"\b(?:sink|sinking|sank|sunk|submerged|drown(?:ing|ed)?|underwater)\b"
+    r".{0,20}\b(?:sea|ocean|water)\b|"
+    r"\bunderwater\b.{0,20}"
+    r"\b(?:portrait|person|girl|boy|woman|man|character|figure|subject)\b|"
+    r"\b(?:portrait|person|girl|boy|woman|man|character|figure|subject)\b"
+    r".{0,20}\bunderwater\b"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+UNDERWATER_NEGATION_PATTERN = re.compile(
+    r"(?:不要|不含|没有|禁止|排除|去掉|避免)(?:任何)?"
+    r"(?:海|水|水下|水中|溺水)(?:元素|场景)?|"
+    r"(?:水中|海|水)(?:なし|不要|禁止|描かない|入れない|含めない)|"
+    r"\b(?:no|not|without|avoid|exclude)\s+(?:any\s+)?"
+    r"(?:underwater|submerged|drowning|sea|ocean|water)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+EXPLICIT_OTHER_SUBJECT_PATTERN = re.compile(
+    r"(?:非二元|ノンバイナリ|Xジェンダー)|"
+    r"(?:中性|无性别|性别不明|非二元)(?:的)?(?:主体|人物|角色|人)|"
+    r"(?:主体|人物|角色|人).{0,6}(?:中性|无性别|性别不明|非二元)|"
+    r"(?:ジェンダーニュートラル|無性別|性別不詳|ノンバイナリ)(?:な)?"
+    r"(?:人物|人|キャラクター)|"
+    r"\b(?:agender|non[- ]?binary|genderfluid|genderqueer)\b|"
+    r"\b(?:gender[- ]neutral|androgynous|genderless|gender[- ]unknown|"
+    r"non[- ]binary)\b.{0,12}\b(?:person|character|figure|subject)\b|"
+    r"\b(?:person|character|figure|subject)\b.{0,12}"
+    r"\b(?:gender[- ]neutral|androgynous|genderless|gender[- ]unknown|"
+    r"non[- ]binary)\b",
+    re.IGNORECASE,
+)
+DANBOORU_COMMON_REPLACEMENTS = {
+    "ash": ("ashes",),
+    "burnt remains": ("burnt", "debris"),
+    "dark atmosphere": ("dark background",),
+    "hugging self": ("self hug",),
+    "hugging oneself": ("self hug",),
+    "holding oneself": ("self hug",),
+    "distant gaze": ("looking afar",),
+    "gazing at distance": ("looking afar",),
+    "gazing into distance": ("looking afar",),
+    "looking at distance": ("looking afar",),
+    "looking far away": ("looking afar",),
+    "looking into distance": ("looking afar",),
+    "drink box": ("juice box",),
+    "holding drink box": ("holding drink", "juice box"),
+    "holding juice box": ("holding drink", "juice box"),
+    "holding juice pack": ("holding drink", "juice box"),
+    "juice pack": ("juice box",),
+    "self hugging": ("self hug",),
+    "setting sun": ("sunset",),
+    "sunset reflection": ("sunset", "reflection"),
+}
 PROMPT_PLANNER_SYSTEM_PROMPT_PATHS = (
     (
         Path(__file__).resolve().parent
@@ -148,6 +321,64 @@ GENERATION_SIZE_PRESETS = {
     "横图": (1216, 832),
     "方图": (1024, 1024),
 }
+DANBOORU_INTERACTION_PREFIX_PATTERN = re.compile(
+    r"^(?:source|target|mutual)#",
+    re.IGNORECASE,
+)
+DANBOORU_NUMERIC_WEIGHT_PATTERN = re.compile(
+    r"^[+-]?(?:\d+(?:\.\d+)?|\.\d+)::(.*)::$",
+    re.DOTALL,
+)
+DANBOORU_NOVELAI_SPECIAL_TAGS = {
+    "background_dataset",
+    "fur_dataset",
+    "location",
+}
+DANBOORU_NOVELAI_CHARACTER_TYPES = {"girl", "boy", "other"}
+DANBOORU_NOVELAI_SPECIAL_PATTERNS = (re.compile(r"^year_\d{4}$"),)
+QUALITY_PATTERN = re.compile(
+    r"(?i)(?<![a-z0-9_])(?:masterpiece|best quality|very aesthetic|"
+    r"absurdres|amazing quality|highres|score_\d+)(?![a-z0-9_])"
+)
+EXPLANATION_PREFIX_PATTERN = re.compile(
+    r"(?i)^\s*(?:prompt|tags?|output|here\s+(?:is|are))\s*[:\-]"
+)
+PORTRAIT_EXPLICIT_PATTERN = re.compile(
+    r"(?:竖图|纵向|竖构图|portrait orientation|vertical image)",
+    re.IGNORECASE,
+)
+LANDSCAPE_EXPLICIT_PATTERN = re.compile(
+    r"(?:横图|横向|横构图|landscape orientation|horizontal image)",
+    re.IGNORECASE,
+)
+SQUARE_EXPLICIT_PATTERN = re.compile(
+    r"(?:方图|正方形|1\s*[:：]\s*1|square image|square format)",
+    re.IGNORECASE,
+)
+LANDSCAPE_DESCRIPTION_PATTERN = re.compile(
+    r"(?:横图|横向|宽幅|全景|广角|大场景|战斗场面|追逐|并排|肩并肩|面对面|"
+    r"对峙|互相|一起|两人|两名|两个|三人|多人|群像|人群|合照|抱在一起|拥抱|"
+    r"推倒|追赶|车辆|汽车|火车|飞机|船|panorama|wide shot|wide angle|"
+    r"landscape|side by side|facing each other|group shot|crowd|chasing)",
+    re.IGNORECASE,
+)
+LANDSCAPE_PROMPT_PATTERN = re.compile(
+    r"(?<![a-z0-9_])(?:2girls|2boys|2others|3girls|3boys|3others|"
+    r"multiple girls|multiple boys|multiple others|group|crowd|panorama|"
+    r"wide shot|wide angle|scenery|vehicle focus|hugging|pushing|chasing|"
+    r"fighting)(?![a-z0-9_])",
+    re.IGNORECASE,
+)
+SQUARE_DESCRIPTION_PATTERN = re.compile(
+    r"(?:头像|图标|贴纸|表情包|徽章|大头照|正方形|方图|icon|avatar|sticker|"
+    r"emoticon|headshot)",
+    re.IGNORECASE,
+)
+SQUARE_PROMPT_PATTERN = re.compile(
+    r"(?<![a-z0-9_])(?:icon|sticker|emoticon|headshot|face focus|"
+    r"chibi)(?![a-z0-9_])",
+    re.IGNORECASE,
+)
 
 
 class ArtistLibraryState(TypedDict):
@@ -165,6 +396,8 @@ class ArtistUserState(TypedDict):
     last_negative_prompt_by_library: dict[str, str]
     last_character_prompts_by_library: dict[str, list[str]]
     last_character_negative_prompts_by_library: dict[str, list[str]]
+    last_size_by_library: dict[str, list[int]]
+    size_mode: str
     width: int
     height: int
 
@@ -231,12 +464,30 @@ class BugReportState(TypedDict):
 class NovelAIWebError(Exception):
     """Represent a safe error message that can be returned to the bot owner."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        tag_hit_count: int | None = None,
+        tag_total_count: int | None = None,
+    ) -> None:
+        """Initialize one safe plugin failure.
+
+        Args:
+            message: User-facing error message.
+            tag_hit_count: Number of locally accepted tags in one candidate.
+            tag_total_count: Number of locally checked tags in one candidate.
+        """
+        super().__init__(message)
+        self.tag_hit_count = tag_hit_count
+        self.tag_total_count = tag_total_count
+
 
 @star.register(
     PLUGIN_NAME,
     "yzxzc",
     "Generate guarded zero-Anlas NovelAI images through the official API.",
-    "3.1.0",
+    "3.2.0",
 )
 class NovelAIWebPlugin(star.Star):
     """Call NovelAI with a persistent API token and strict free-tier guards."""
@@ -256,10 +507,12 @@ class NovelAIWebPlugin(star.Star):
         self._artist_state_lock = asyncio.Lock()
         self._character_state_lock = asyncio.Lock()
         self._bug_report_lock = asyncio.Lock()
+        self._tagger_lock = asyncio.Lock()
         self._pending_character_changes: dict[
             tuple[str, str], PendingCharacterChange
         ] = {}
         self._api_client: httpx.AsyncClient | None = None
+        self._local_image_tagger: LocalImageTagger | None = None
 
     @staticmethod
     def _load_api_token() -> str:
@@ -343,7 +596,7 @@ class NovelAIWebPlugin(star.Star):
                 base_url=NOVELAI_API_BASE_URL,
                 headers={
                     "Authorization": f"Bearer {self._load_api_token()}",
-                    "User-Agent": "AstrBot-NovelAI/3.1.0",
+                    "User-Agent": "AstrBot-NovelAI/3.2.0",
                 },
                 follow_redirects=False,
             )
@@ -421,7 +674,7 @@ class NovelAIWebPlugin(star.Star):
             [
                 "NovelAI 指令帮助",
                 "/nai help - 显示这份帮助",
-                "/nai 生成 <内容> - 自然语言由 DeepSeek 规划，标签 Prompt 原样直通",
+                "/nai 生成 <内容> [附图] - 自然语言由 DeepSeek 规划，附图先由本地 Tagger 反推",
                 "/nai 重抽 - 原样复用自己上一次成功生成的 Prompt",
                 "/nai bug反馈 <问题描述> - 记录问题并通知管理员",
                 "/nai 添加画师串 <串名称> <内容> - 保存或覆盖本群画师串",
@@ -435,7 +688,7 @@ class NovelAIWebPlugin(star.Star):
                 "/nai 确认 - 确认 60 秒内的人物覆盖或删除请求",
                 "/nai 人物 - 列出本群人物名称",
                 "/nai 人物 <角色名> - 查看人物 Prompt",
-                "/nai 切换大小 竖图|横图|方图 - 使用 NovelAI NORMAL 预设",
+                "/nai 切换大小 自动|竖图|横图|方图 - 自动构图或锁定 NORMAL 预设",
                 "/nai 自定义大小 <宽>x<高> - 设置免费范围内的自定义尺寸",
             ]
         )
@@ -447,6 +700,8 @@ class NovelAIWebPlugin(star.Star):
             [
                 "NovelAI 管理员指令",
                 "/nai_status - 检查 PAT、Opus、Anlas 与免费生成参数",
+                "/nai 更新词库 - 更新本地 Danbooru 校验词库",
+                "/nai 更新Tagger - 下载本地 WD SwinV2 图片反推模型（约 470 MB）",
             ]
         )
 
@@ -464,6 +719,16 @@ class NovelAIWebPlugin(star.Star):
     def _bug_report_state_path() -> Path:
         """Return the persistent user bug report state path."""
         return star.StarTools.get_data_dir(PLUGIN_NAME) / "bug_reports.json"
+
+    @staticmethod
+    def _danbooru_cache_path() -> Path:
+        """Return the plugin-local Danbooru vocabulary path."""
+        return star.StarTools.get_data_dir(PLUGIN_NAME) / "danbooru-tags.sqlite3"
+
+    @staticmethod
+    def _tagger_data_dir() -> Path:
+        """Return the plugin-local WD tagger model directory."""
+        return star.StarTools.get_data_dir(PLUGIN_NAME) / "wd-tagger"
 
     @staticmethod
     def _load_prompt_planner_system_prompt() -> str:
@@ -504,29 +769,51 @@ class NovelAIWebPlugin(star.Star):
             payload = json.loads(raw_response)
         except (json.JSONDecodeError, TypeError) as exc:
             raise NovelAIWebError("Prompt 规划模型没有返回有效 JSON。") from exc
-        if not isinstance(payload, dict) or not isinstance(payload.get("ok"), bool):
+        expected_fields = {"ok", "prompt", "character_prompts", "error"}
+        if (
+            isinstance(payload, dict)
+            and payload.get("ok") is True
+            and set(payload) == expected_fields - {"error"}
+        ):
+            payload["error"] = None
+        if not isinstance(payload, dict) or set(payload) != expected_fields:
             raise NovelAIWebError("Prompt 规划模型返回了无效协议。")
+        if not isinstance(payload.get("ok"), bool):
+            raise NovelAIWebError("Prompt 规划模型返回了无效 ok 字段。")
         if payload["ok"] is False:
-            error_code = str(payload.get("error") or "request_rejected").strip()
-            if error_code == "conflicting_constraints":
-                raise NovelAIWebError("画面描述存在无法消解的互斥约束，请修改后重试。")
-            raise NovelAIWebError("Prompt 规划模型拒绝了该描述。")
-
-        if set(payload) != {"ok", "prompt", "character_prompts", "error"}:
-            raise NovelAIWebError("Prompt 规划模型返回了协议外字段。")
+            if (
+                payload["prompt"] is not None
+                or payload["character_prompts"] != {}
+                or payload["error"] != "conflicting_constraints"
+            ):
+                raise NovelAIWebError("Prompt 规划模型返回了无效失败协议。")
+            raise NovelAIWebError("画面描述存在无法消解的互斥约束，请修改后重试。")
+        if payload["error"] is not None:
+            raise NovelAIWebError("Prompt 规划模型成功响应的 error 必须为 null。")
 
         planned_prompt = payload.get("prompt")
-        if not isinstance(planned_prompt, str):
+        if not isinstance(planned_prompt, str) or any(
+            ord(character) < 32 for character in planned_prompt
+        ):
             raise NovelAIWebError("Prompt 规划模型没有返回 Prompt。")
-        planned_prompt = re.sub(r"\s+", " ", planned_prompt).strip(" ,")
+        planned_prompt = re.sub(r" +", " ", planned_prompt).strip(" ,")
         if not planned_prompt:
             raise NovelAIWebError("Prompt 规划模型返回了空 Prompt。")
+        if (
+            not planned_prompt.isascii()
+            or "```" in planned_prompt
+            or EXPLANATION_PREFIX_PATTERN.search(planned_prompt)
+        ):
+            raise NovelAIWebError("Prompt 必须只包含英文标签且不能包含 Markdown。")
         forbidden = re.search(
-            r"(?i)(?:\bartist\s*:|\bartist collaboration\b|\bchar\s*\d+\s*:)",
+            r"(?i)(?:\bartist\s*:|\bartist collaboration\b|"
+            r"\bchar\s*\d+\s*:|\bundesired content\b)",
             planned_prompt,
         )
         if forbidden:
             raise NovelAIWebError("Prompt 规划结果包含应由插件管理的画师或角色字段。")
+        if QUALITY_PATTERN.search(planned_prompt):
+            raise NovelAIWebError("Prompt 规划结果包含由 Quality Toggle 管理的质量词。")
         returned_slots = CHARACTER_SLOT_PATTERN.findall(planned_prompt)
         if returned_slots:
             raise NovelAIWebError("人物占位符不能出现在主 Prompt 中。")
@@ -540,13 +827,23 @@ class NovelAIWebPlugin(star.Star):
         character_prompts: dict[str, str] = {}
         for slot in required_character_slots:
             value = raw_character_prompts.get(slot)
-            if not isinstance(value, str):
+            if not isinstance(value, str) or any(
+                ord(character) < 32 for character in value
+            ):
                 raise NovelAIWebError("Prompt 规划模型返回了无效人物 Prompt。")
-            value = re.sub(r"\s+", " ", value).strip(" ,")
-            if CHARACTER_SLOT_PATTERN.search(value):
-                raise NovelAIWebError("人物 Prompt 值中不能再次包含人物占位符。")
-            if re.search(r"(?i)\bartist\s*:", value):
-                raise NovelAIWebError("人物 Prompt 中不能包含画师标签。")
+            value = re.sub(r" +", " ", value).strip(" ,")
+            if not value.isascii() or "```" in value:
+                raise NovelAIWebError("人物 Prompt 必须只包含英文标签。")
+            if (
+                CHARACTER_SLOT_PATTERN.search(value)
+                or re.search(
+                    r"(?i)(?:\bartist\s*:|\bartist collaboration\b|"
+                    r"\bchar\s*\d+\s*:|\bundesired content\b)",
+                    value,
+                )
+                or QUALITY_PATTERN.search(value)
+            ):
+                raise NovelAIWebError("人物 Prompt 包含禁止字段或质量词。")
             character_prompts[slot] = value
 
         combined_length = len(planned_prompt) + sum(
@@ -631,13 +928,28 @@ class NovelAIWebPlugin(star.Star):
         hug_is_negated = bool(
             re.search(
                 r"(?:不要|不|没有|禁止|拒绝)\s*(?:互相)?(?:拥抱|抱在一起)|"
+                r"(?:抱き合|ハグ|抱擁).{0,4}(?:ない|ません|禁止)|"
                 r"\b(?:no|not|without)\s+hugg?",
+                description,
+                re.IGNORECASE,
+            )
+        )
+        two_girls_is_negated = bool(
+            re.search(
+                r"(?:二人|2人)の?(?:女の子|少女|女子).{0,6}"
+                r"(?:ではなく|じゃなく|ではない)|"
+                r"(?:不是|并非|不要)\s*(?:两个|两名|2\s*个)\s*(?:女孩|女生|少女)|"
+                r"\bnot\s+(?:two|2)\s+girls?\b",
                 description,
                 re.IGNORECASE,
             )
         )
         errors: list[str] = []
         for name, source_pattern, output_pattern in SEMANTIC_ANCHOR_RULES:
+            if name == "2girls" and two_girls_is_negated:
+                if output_pattern.search(combined_prompt):
+                    errors.append("错误增加 2girls")
+                continue
             if name == "hugging" and hug_is_negated:
                 if output_pattern.search(combined_prompt):
                     errors.append("错误增加 hugging")
@@ -646,6 +958,29 @@ class NovelAIWebPlugin(star.Star):
                 combined_prompt
             ):
                 errors.append(f"缺少 {name}")
+        if UNDERWATER_SCENE_SOURCE_PATTERN.search(
+            description
+        ) and not UNDERWATER_NEGATION_PATTERN.search(description):
+            if not re.search(
+                r"(?<![a-z])(?:underwater|submerged|sinking|drowning)(?![a-z])",
+                combined_prompt,
+                re.IGNORECASE,
+            ):
+                errors.append("缺少 underwater/sinking 水下动作")
+            if not re.search(
+                r"(?<![a-z])(?:ocean|sea|water)(?![a-z])",
+                combined_prompt,
+                re.IGNORECASE,
+            ):
+                errors.append("缺少 ocean/sea 水下环境")
+            if re.search(r"\b(?:simple|white) background\b", combined_prompt, re.I):
+                errors.append("水下意象不能使用 simple background")
+        if re.search(
+            r"(?<![a-z0-9_])1other(?![a-z0-9_])",
+            plan["prompt"],
+            re.IGNORECASE,
+        ) and not EXPLICIT_OTHER_SUBJECT_PATTERN.search(description):
+            errors.append("不要用 1other 代替未知性别")
         if re.search(r"推倒|\bpush(?:ing|ed)?\s+(?:down|over)\b", description, re.I):
             if not (
                 re.search(r"\bpush", plan["prompt"], re.I)
@@ -662,10 +997,10 @@ class NovelAIWebPlugin(star.Star):
             if len(ordered_slots) >= 2:
                 source_prompt = plan["character_prompts"].get(ordered_slots[0], "")
                 target_prompt = plan["character_prompts"].get(ordered_slots[1], "")
-                if not re.search(r"\bsource#push", source_prompt, re.I):
-                    errors.append("主动人物缺少 source#push")
-                if not re.search(r"\btarget#push", target_prompt, re.I):
-                    errors.append("被动人物缺少 target#push")
+                if not re.search(r"\bsource#pushing", source_prompt, re.I):
+                    errors.append("主动人物缺少 source#pushing")
+                if not re.search(r"\btarget#pushing", target_prompt, re.I):
+                    errors.append("被动人物缺少 target#pushing")
                 if not re.search(
                     r"\b(?:standing|leaning|reaching|arm extended|looking down)",
                     source_prompt,
@@ -684,6 +1019,139 @@ class NovelAIWebPlugin(star.Star):
         ):
             errors.append("凭空增加画师或画具")
         return errors
+
+    def _validate_danbooru_plan(
+        self,
+        plan: PromptPlan,
+    ) -> None:
+        """Reject model-invented phrases using the plugin-local tag database.
+
+        Args:
+            plan: Parsed main and per-character prompts.
+
+        Raises:
+            NovelAIWebError: If syntax, tag metadata, or the local cache is invalid.
+        """
+        candidates: dict[str, list[str]] = {}
+        accepted_without_lookup: set[str] = set()
+        interaction_candidate_names: set[str] = set()
+        prefixed_main_tags: list[str] = []
+        prompt_groups = [(plan["prompt"], False)]
+        prompt_groups.extend(
+            (prompt, True) for prompt in plan["character_prompts"].values()
+        )
+        for prompt, is_character_prompt in prompt_groups:
+            for raw_item in prompt.split(","):
+                item = raw_item.strip()
+                if not item:
+                    continue
+                lookup_value = item
+                for _ in range(8):
+                    previous = lookup_value
+                    weight_match = DANBOORU_NUMERIC_WEIGHT_PATTERN.fullmatch(
+                        lookup_value
+                    )
+                    if weight_match:
+                        lookup_value = weight_match.group(1).strip()
+                    elif (
+                        len(lookup_value) >= 2
+                        and lookup_value[0] in "{["
+                        and lookup_value[-1] == ("}" if lookup_value[0] == "{" else "]")
+                    ):
+                        lookup_value = lookup_value[1:-1].strip()
+                    if lookup_value == previous:
+                        break
+                interaction_match = DANBOORU_INTERACTION_PREFIX_PATTERN.match(
+                    lookup_value
+                )
+                if interaction_match:
+                    if not is_character_prompt:
+                        prefixed_main_tags.append(item)
+                    lookup_value = lookup_value[interaction_match.end() :].strip()
+                normalized = re.sub(r"\s+", "_", lookup_value.casefold())
+                if interaction_match:
+                    interaction_candidate_names.add(normalized)
+                if not normalized:
+                    candidates.setdefault(normalized, []).append(item)
+                    continue
+                if normalized in DANBOORU_NOVELAI_SPECIAL_TAGS or any(
+                    pattern.fullmatch(normalized)
+                    for pattern in DANBOORU_NOVELAI_SPECIAL_PATTERNS
+                ):
+                    accepted_without_lookup.add(normalized)
+                    continue
+                if (
+                    is_character_prompt
+                    and normalized in DANBOORU_NOVELAI_CHARACTER_TYPES
+                ):
+                    accepted_without_lookup.add(normalized)
+                    continue
+                candidates.setdefault(normalized, []).append(item)
+
+        if prefixed_main_tags:
+            raise NovelAIWebError(
+                "V4 source#/target#/mutual# 动作只能出现在人物 Prompt："
+                + "、".join(prefixed_main_tags[:8])
+            )
+        if not candidates:
+            return
+        if "" in candidates or len(candidates) > 200:
+            raise NovelAIWebError(
+                "Prompt 包含无法解析的标签语法或超过 200 个不同标签。"
+            )
+        try:
+            minimum_posts = int(
+                self.config.get(
+                    "danbooru_min_post_count",
+                    DEFAULT_DANBOORU_MIN_POST_COUNT,
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise NovelAIWebError("danbooru_min_post_count 必须是整数。") from exc
+        if not 50 <= minimum_posts <= 1_000_000:
+            raise NovelAIWebError("danbooru_min_post_count 必须在 50 到 1000000 之间。")
+        try:
+            resolved, metadata = lookup_local_tags(
+                set(candidates),
+                self._danbooru_cache_path(),
+            )
+        except (FileNotFoundError, OSError, sqlite3.Error) as exc:
+            raise NovelAIWebError(
+                "本地 Danbooru 词库不存在或已损坏，请管理员先执行 /nai 更新词库。"
+            ) from exc
+        invalid_items: list[str] = []
+        invalid_names: set[str] = set()
+        for original, resolved_name in resolved.items():
+            tag = metadata.get(resolved_name)
+            if tag is None or tag.post_count < minimum_posts or tag.category == 1:
+                invalid_names.add(original)
+                invalid_items.extend(candidates[original])
+        if invalid_items:
+            unique_items = list(dict.fromkeys(invalid_items))
+            shown = "、".join(unique_items[:20])
+            suffix = "等" if len(unique_items) > 20 else ""
+            fallback_allowed = not bool(
+                invalid_names.intersection(interaction_candidate_names)
+            )
+            raise NovelAIWebError(
+                "以下内容不在本地可靠 Danbooru 词库中"
+                "（不存在、作品数过低或为画师标签）："
+                f"{shown}{suffix}。请只用现行精确 tag 替换，不要改写原始需求。",
+                tag_hit_count=(
+                    (
+                        len(candidates)
+                        + len(accepted_without_lookup)
+                        - len(invalid_names)
+                    )
+                    if fallback_allowed
+                    else None
+                ),
+                tag_total_count=(
+                    len(candidates) + len(accepted_without_lookup)
+                    if fallback_allowed
+                    else None
+                ),
+            )
 
     async def _plan_prompt(
         self,
@@ -712,6 +1180,14 @@ class NovelAIWebPlugin(star.Star):
                 "character_prompts": dict.fromkeys(required_character_slots, ""),
             }
 
+        if (
+            bool(self.config.get("validate_danbooru_tags", True))
+            and read_cache_info(self._danbooru_cache_path()) is None
+        ):
+            raise NovelAIWebError(
+                "本地 Danbooru 词库不存在或已损坏，请管理员先执行 /nai 更新词库。"
+            )
+
         provider_id = str(
             self.config.get(
                 "prompt_planner_provider_id",
@@ -724,12 +1200,16 @@ class NovelAIWebPlugin(star.Star):
         if CHIBI_SOURCE_PATTERN.search(description):
             system_prompt += (
                 "\n\n本次输入包含强风格约束 Q版/chibi。必须在主 Prompt 开头保留 "
-                "`chibi, super deformed`；身份、动作和必要场景仍需表达，但使用 "
+                "现行标签 `chibi`；身份、动作和必要场景仍需表达，但使用 "
                 "6–14 个紧凑标签，避免自动补充 realistic proportions、photorealistic、"
                 "tall、long legs 或写实电影镜头等会稀释 Q 版比例的内容。"
             )
         retry_prompt = description
         last_error: NovelAIWebError | None = None
+        last_candidate_json = ""
+        best_danbooru_plan: PromptPlan | None = None
+        best_danbooru_score: tuple[float, int, int] | None = None
+        best_danbooru_counts = (0, 0)
 
         for attempt in range(3):
             try:
@@ -758,6 +1238,28 @@ class NovelAIWebPlugin(star.Star):
                     max_length
                     - sum(len(value) for value in plan["character_prompts"].values()),
                 )
+                prompt_items: list[str] = []
+                for item in plan["prompt"].split(","):
+                    item = item.strip()
+                    if item:
+                        prompt_items.extend(
+                            DANBOORU_COMMON_REPLACEMENTS.get(item.casefold(), (item,))
+                        )
+                plan["prompt"] = ", ".join(dict.fromkeys(prompt_items))
+                for slot, character_prompt in plan["character_prompts"].items():
+                    character_items: list[str] = []
+                    for item in character_prompt.split(","):
+                        item = item.strip()
+                        if item:
+                            character_items.extend(
+                                DANBOORU_COMMON_REPLACEMENTS.get(
+                                    item.casefold(),
+                                    (item,),
+                                )
+                            )
+                    plan["character_prompts"][slot] = ", ".join(
+                        dict.fromkeys(character_items)
+                    )
                 if CHIBI_SOURCE_PATTERN.search(description):
                     prompt_items = [
                         item.strip()
@@ -775,9 +1277,7 @@ class NovelAIWebPlugin(star.Star):
                             "photorealistic",
                         }
                     ]
-                    plan["prompt"] = ", ".join(
-                        ("chibi", "super deformed", *prompt_items)
-                    )
+                    plan["prompt"] = ", ".join(("chibi", *prompt_items))
                     if (
                         len(plan["prompt"])
                         + sum(
@@ -786,6 +1286,16 @@ class NovelAIWebPlugin(star.Star):
                         > max_length
                     ):
                         raise NovelAIWebError("Q版风格锁定后的 Prompt 超过长度上限。")
+                last_candidate_json = json.dumps(
+                    {
+                        "ok": True,
+                        "prompt": plan["prompt"],
+                        "character_prompts": plan["character_prompts"],
+                        "error": None,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
                 semantic_errors = self._semantic_plan_errors(description, plan)
                 if semantic_errors:
                     raise NovelAIWebError(
@@ -793,23 +1303,214 @@ class NovelAIWebPlugin(star.Star):
                         + "、".join(semantic_errors)
                         + "。"
                     )
+                if bool(self.config.get("validate_danbooru_tags", True)):
+                    self._validate_danbooru_plan(plan)
                 return plan
             except NovelAIWebError as exc:
                 last_error = exc
-                if attempt < 2:
-                    retry_prompt = (
-                        f"上一次输出无效：{exc} 请重新规划以下原始描述，"
-                        "逐项保留人数、主体、动作、关系和环境，"
-                        "只返回协议规定的一行 JSON：\n" + description
+                if (
+                    exc.tag_hit_count is not None
+                    and exc.tag_total_count
+                    and last_candidate_json
+                ):
+                    candidate_score = (
+                        exc.tag_hit_count / exc.tag_total_count,
+                        exc.tag_hit_count,
+                        attempt,
                     )
+                    if (
+                        best_danbooru_score is None
+                        or candidate_score > best_danbooru_score
+                    ):
+                        best_danbooru_plan = {
+                            "prompt": plan["prompt"],
+                            "character_prompts": dict(plan["character_prompts"]),
+                        }
+                        best_danbooru_score = candidate_score
+                        best_danbooru_counts = (
+                            exc.tag_hit_count,
+                            exc.tag_total_count,
+                        )
+                if attempt < 2:
+                    if (
+                        last_candidate_json
+                        and "以下内容不在本地可靠 Danbooru 词库中" in str(exc)
+                    ):
+                        retry_prompt = (
+                            f"上一版候选 JSON：{last_candidate_json}\n"
+                            f"本地精确 tag 校验错误：{exc}\n"
+                            "只替换或删除错误中列出的无效 tag；保留其余有效 tag、"
+                            "人物槽位、核心语义和构图，不要重新设计整幅画。"
+                            "只返回协议规定的一行 JSON。\n原始描述：" + description
+                        )
+                    else:
+                        retry_prompt = (
+                            f"上一次输出无效：{exc} 请重新规划以下原始描述，"
+                            "逐项保留原文语言、人数、主体、动作、关系、环境、"
+                            "主导意象及空间或材质隐喻，"
+                            "只返回协议规定的一行 JSON：\n" + description
+                        )
 
+        if best_danbooru_plan is not None:
+            hit_count, total_count = best_danbooru_counts
+            logger.warning(
+                "Using highest-hit planner candidate after bounded repairs: "
+                "%s/%s tags (%.1f%%).",
+                hit_count,
+                total_count,
+                hit_count / total_count * 100,
+            )
+            return best_danbooru_plan
         raise last_error or NovelAIWebError("Prompt 规划失败。")
+
+    async def _reference_image_path(
+        self,
+        event: AstrMessageEvent,
+    ) -> Path | None:
+        """Resolve at most one direct or quoted QQ image to a local path.
+
+        Args:
+            event: Incoming command event containing optional image components.
+
+        Returns:
+            Validated local image path, or ``None`` when no image was attached.
+
+        Raises:
+            NovelAIWebError: If multiple, unreadable, or oversized images are supplied.
+        """
+        try:
+            components = tuple(event.get_messages())
+        except (AttributeError, TypeError):
+            components = ()
+        image_references: list[str] = []
+        reply_components: list[Reply] = []
+        try:
+            for component in components:
+                if isinstance(component, MessageImage):
+                    image_references.append(await component.convert_to_file_path())
+                elif isinstance(component, Reply):
+                    reply_components.append(component)
+                    if component.chain:
+                        for reply_component in component.chain:
+                            if isinstance(reply_component, MessageImage):
+                                image_references.append(
+                                    await reply_component.convert_to_file_path()
+                                )
+            for reply_component in reply_components:
+                if component_images := await extract_quoted_message_images(
+                    event,
+                    reply_component,
+                ):
+                    image_references.extend(component_images)
+        except Exception as exc:
+            raise NovelAIWebError("无法读取 QQ 消息中的参考图片。") from exc
+
+        unique_references = list(dict.fromkeys(image_references))
+        if not unique_references:
+            return None
+        if len(unique_references) > 1:
+            raise NovelAIWebError("一次生成只能附带一张参考图片。")
+        image_path = Path(unique_references[0]).resolve(strict=False)
+        try:
+            max_image_bytes = int(
+                self.config.get("tagger_max_image_bytes", 20 * 1024 * 1024)
+            )
+            max_image_pixels = int(
+                self.config.get("tagger_max_image_pixels", 25_000_000)
+            )
+        except (TypeError, ValueError) as exc:
+            raise NovelAIWebError("Tagger 图片安全配置必须是整数。") from exc
+        if not 1024 <= max_image_bytes <= 64 * 1024 * 1024:
+            raise NovelAIWebError("tagger_max_image_bytes 配置超出安全范围。")
+        if not 1_048_576 <= max_image_pixels <= 100_000_000:
+            raise NovelAIWebError("tagger_max_image_pixels 配置超出安全范围。")
+        try:
+            if not image_path.is_file() or image_path.stat().st_size > max_image_bytes:
+                raise NovelAIWebError("参考图片不存在或超过 Tagger 大小上限。")
+            with Image.open(image_path) as image:
+                image.verify()
+            with Image.open(image_path) as image:
+                width, height = image.size
+                if width <= 0 or height <= 0 or width * height > max_image_pixels:
+                    raise NovelAIWebError("参考图片像素尺寸超过 Tagger 安全上限。")
+        except NovelAIWebError:
+            raise
+        except (Image.DecompressionBombError, UnidentifiedImageError, OSError) as exc:
+            raise NovelAIWebError("参考图片格式无效或已损坏。") from exc
+        return image_path
+
+    async def _tag_reference_image(self, image_path: Path) -> tuple[str, ...]:
+        """Run the reusable local WD tagger and filter its output through SQLite.
+
+        Args:
+            image_path: Validated local image path.
+
+        Returns:
+            Ordered reliable Danbooru tags inferred from the image.
+
+        Raises:
+            NovelAIWebError: If the model, runtime, or vocabulary is unavailable.
+        """
+        info = read_tagger_info(self._tagger_data_dir())
+        if info is None:
+            raise NovelAIWebError(
+                "本地图片 Tagger 尚未安装，请管理员先执行 /nai 更新Tagger。"
+            )
+        try:
+            general_threshold = float(self.config.get("tagger_general_threshold", 0.30))
+            character_threshold = float(
+                self.config.get("tagger_character_threshold", 0.85)
+            )
+            max_tags = int(self.config.get("tagger_max_tags", 80))
+        except (TypeError, ValueError) as exc:
+            raise NovelAIWebError("Tagger 阈值配置无效。") from exc
+        async with self._tagger_lock:
+            if (
+                self._local_image_tagger is None
+                or self._local_image_tagger.info != info
+            ):
+                self._local_image_tagger = LocalImageTagger(info)
+            try:
+                tags = await asyncio.to_thread(
+                    self._local_image_tagger.tag,
+                    image_path,
+                    general_threshold,
+                    character_threshold,
+                    max_tags,
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise NovelAIWebError(f"本地图片 Tagger 运行失败：{exc}") from exc
+        if not tags:
+            raise NovelAIWebError("本地图片 Tagger 没有识别出可靠内容。")
+
+        normalized_to_original = {
+            re.sub(r"\s+", "_", tag.casefold()): tag for tag in tags
+        }
+        try:
+            resolved, metadata = lookup_local_tags(
+                set(normalized_to_original),
+                self._danbooru_cache_path(),
+            )
+        except (FileNotFoundError, OSError, sqlite3.Error) as exc:
+            raise NovelAIWebError(
+                "本地 Danbooru 词库不存在或已损坏，请管理员先执行 /nai 更新词库。"
+            ) from exc
+        reliable_tags = tuple(
+            normalized_to_original[name]
+            for name in normalized_to_original
+            if (tag := metadata.get(resolved[name])) is not None
+            and tag.post_count >= DEFAULT_DANBOORU_MIN_POST_COUNT
+            and tag.category != 1
+        )
+        if not reliable_tags:
+            raise NovelAIWebError("Tagger 结果未通过本地 Danbooru 词库校验。")
+        return reliable_tags
 
     def _load_artist_state(self) -> ArtistState:
         """Load shared libraries and per-QQ selections with legacy migration."""
         state_path = self._artist_state_path()
         if not state_path.is_file():
-            return {"version": 6, "libraries": {}, "users": {}}
+            return {"version": 7, "libraries": {}, "users": {}}
         try:
             raw_state = json.loads(state_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -1000,6 +1701,36 @@ class NovelAIWebPlugin(star.Star):
                     )
                 except (TypeError, ValueError, NovelAIWebError):
                     width, height = DEFAULT_GENERATION_SIZE
+                raw_size_mode = raw_user.get("size_mode")
+                if raw_size_mode in {"auto", "fixed"}:
+                    size_mode = raw_size_mode
+                else:
+                    size_mode = (
+                        "auto"
+                        if (width, height) == DEFAULT_GENERATION_SIZE
+                        else "fixed"
+                    )
+                last_size_by_library: dict[str, list[int]] = {}
+                raw_last_sizes = raw_user.get("last_size_by_library", {})
+                if isinstance(raw_last_sizes, dict):
+                    for library_key, dimensions in raw_last_sizes.items():
+                        if (
+                            not isinstance(library_key, str)
+                            or not isinstance(dimensions, list)
+                            or len(dimensions) != 2
+                        ):
+                            continue
+                        try:
+                            last_width, last_height = self._validate_generation_size(
+                                int(dimensions[0]),
+                                int(dimensions[1]),
+                            )
+                        except (TypeError, ValueError, NovelAIWebError):
+                            continue
+                        last_size_by_library[library_key] = [
+                            last_width,
+                            last_height,
+                        ]
                 users[sender_id] = {
                     "active_by_library": active_by_library,
                     "negative_prompt_by_library": negative_prompt_by_library,
@@ -1013,10 +1744,12 @@ class NovelAIWebPlugin(star.Star):
                     "last_character_negative_prompts_by_library": (
                         last_character_negative_prompts_by_library
                     ),
+                    "last_size_by_library": last_size_by_library,
+                    "size_mode": size_mode,
                     "width": width,
                     "height": height,
                 }
-        return {"version": 6, "libraries": libraries, "users": users}
+        return {"version": 7, "libraries": libraries, "users": users}
 
     def _save_artist_state(self, state: ArtistState) -> None:
         """Atomically persist per-QQ artist strings and selections."""
@@ -1690,6 +2423,8 @@ class NovelAIWebPlugin(star.Star):
             "last_negative_prompt_by_library": {},
             "last_character_prompts_by_library": {},
             "last_character_negative_prompts_by_library": {},
+            "last_size_by_library": {},
+            "size_mode": "auto",
             "width": DEFAULT_GENERATION_SIZE[0],
             "height": DEFAULT_GENERATION_SIZE[1],
         }
@@ -1735,6 +2470,7 @@ class NovelAIWebPlugin(star.Star):
         character_prompts: tuple[str, ...] = (),
         negative_prompt: str = "",
         character_negative_prompts: tuple[str, ...] = (),
+        generation_size: tuple[int, int] | None = None,
     ) -> None:
         """Persist one successful generation for this QQ and conversation.
 
@@ -1744,6 +2480,7 @@ class NovelAIWebPlugin(star.Star):
             character_prompts: Final native V4 character captions.
             negative_prompt: Final base negative prompt.
             character_negative_prompts: Final native V4 character negatives.
+            generation_size: Resolved successful size for deterministic redraw.
         """
         sender_id = self._artist_owner_id(event)
         library_key = self._artist_library_key(event)
@@ -1761,12 +2498,24 @@ class NovelAIWebPlugin(star.Star):
             user_state["last_character_negative_prompts_by_library"][library_key] = (
                 list(character_negative_prompts)
             )
+            if generation_size is not None:
+                width, height = self._validate_generation_size(*generation_size)
+                user_state["last_size_by_library"][library_key] = [width, height]
             self._save_artist_state(state)
 
     async def _last_successful_prompt(
         self,
         event: AstrMessageEvent,
-    ) -> tuple[str, tuple[str, ...], str, tuple[str, ...]] | None:
+    ) -> (
+        tuple[
+            str,
+            tuple[str, ...],
+            str,
+            tuple[str, ...],
+            tuple[int, int] | None,
+        ]
+        | None
+    ):
         """Return this QQ's last successful generation in this conversation.
 
         Args:
@@ -1774,7 +2523,7 @@ class NovelAIWebPlugin(star.Star):
 
         Returns:
             Base prompt, native character captions, base negative prompt, and
-            character negatives, or ``None`` when absent.
+            character negatives, resolved size, or ``None`` when absent.
         """
         sender_id = self._artist_owner_id(event)
         library_key = self._artist_library_key(event)
@@ -1796,11 +2545,18 @@ class NovelAIWebPlugin(star.Star):
             character_negative_prompts = user_state[
                 "last_character_negative_prompts_by_library"
             ].get(library_key, [])
+            dimensions = user_state["last_size_by_library"].get(library_key)
+            generation_size = (
+                (dimensions[0], dimensions[1])
+                if isinstance(dimensions, list) and len(dimensions) == 2
+                else None
+            )
             return (
                 prompt,
                 tuple(character_prompts),
                 negative_prompt,
                 tuple(character_negative_prompts),
+                generation_size,
             )
 
     def _validate_generation_size(self, width: int, height: int) -> tuple[int, int]:
@@ -2019,23 +2775,78 @@ class NovelAIWebPlugin(star.Star):
                 sender_id,
                 self._new_user_state(),
             )
+            user_state["size_mode"] = "fixed"
             user_state["width"] = width
             user_state["height"] = height
             self._save_artist_state(state)
         return width, height
 
+    async def _set_user_auto_size(self, event: AstrMessageEvent) -> None:
+        """Enable deterministic per-request aspect selection for one QQ user.
+
+        Args:
+            event: Message event identifying the QQ user.
+        """
+        sender_id = self._artist_owner_id(event)
+        async with self._artist_state_lock:
+            state = self._load_artist_state()
+            user_state = state["users"].setdefault(
+                sender_id,
+                self._new_user_state(),
+            )
+            user_state["size_mode"] = "auto"
+            self._save_artist_state(state)
+
     async def _user_generation_size(
         self,
         event: AstrMessageEvent,
+        description: str = "",
+        planned_prompt: str = "",
+        previous_size: tuple[int, int] | None = None,
     ) -> tuple[int, int]:
-        """Return the generation size selected by the current QQ user."""
+        """Resolve fixed or content-aware generation size for one request.
+
+        Args:
+            event: Message event identifying the QQ user.
+            description: Original user request used for explicit composition cues.
+            planned_prompt: Final validated content tags used for visual cues.
+            previous_size: Last successful resolved size for redraw.
+
+        Returns:
+            One validated free-tier size preset or the user's fixed custom size.
+        """
         sender_id = self._artist_owner_id(event)
         async with self._artist_state_lock:
             state = self._load_artist_state()
             user_state = state["users"].get(sender_id)
             if user_state is None:
-                return DEFAULT_GENERATION_SIZE
-            return user_state["width"], user_state["height"]
+                size_mode = "auto"
+                fixed_size = DEFAULT_GENERATION_SIZE
+            else:
+                size_mode = user_state["size_mode"]
+                fixed_size = (user_state["width"], user_state["height"])
+        if size_mode == "fixed":
+            return self._validate_generation_size(*fixed_size)
+        if previous_size is not None:
+            return self._validate_generation_size(*previous_size)
+
+        source_text = description.strip()
+        prompt_text = planned_prompt.strip()
+        if PORTRAIT_EXPLICIT_PATTERN.search(source_text):
+            return GENERATION_SIZE_PRESETS["竖图"]
+        if LANDSCAPE_EXPLICIT_PATTERN.search(source_text):
+            return GENERATION_SIZE_PRESETS["横图"]
+        if SQUARE_EXPLICIT_PATTERN.search(source_text):
+            return GENERATION_SIZE_PRESETS["方图"]
+        if LANDSCAPE_DESCRIPTION_PATTERN.search(
+            source_text
+        ) or LANDSCAPE_PROMPT_PATTERN.search(prompt_text):
+            return GENERATION_SIZE_PRESETS["横图"]
+        if SQUARE_DESCRIPTION_PATTERN.search(
+            source_text
+        ) or SQUARE_PROMPT_PATTERN.search(prompt_text):
+            return GENERATION_SIZE_PRESETS["方图"]
+        return DEFAULT_GENERATION_SIZE
 
     def _parse_custom_size(self, value: str) -> tuple[int, int]:
         """Parse custom sizes written as WIDTHxHEIGHT or WIDTH HEIGHT."""
@@ -2229,8 +3040,19 @@ class NovelAIWebPlugin(star.Star):
         try:
             self._check_access(event)
             width, height = await self._user_generation_size(event)
+            sender_id = self._artist_owner_id(event)
+            async with self._artist_state_lock:
+                artist_state = self._load_artist_state()
+                status_user_state = artist_state["users"].get(sender_id)
+                size_mode = (
+                    status_user_state["size_mode"]
+                    if status_user_state is not None
+                    else "auto"
+                )
             selected_artist = await self._active_artist_string(event)
             negative_prompt = await self._user_negative_prompt(event)
+            danbooru_cache_info = read_cache_info(self._danbooru_cache_path())
+            tagger_info = read_tagger_info(self._tagger_data_dir())
             async with self._generation_queue_lock:
                 queue_total = self._generation_queue_size
                 queue_active = (
@@ -2287,9 +3109,18 @@ class NovelAIWebPlugin(star.Star):
             f"队列: 生成中 {queue_active}，等待 {queue_waiting}，总计 {queue_total}\n"
             f"Prompt 模型: {planner_provider}\n"
             f"绘图模型: {NOVELAI_MODEL}\n"
+            "Danbooru 词库: "
+            + (
+                f"{danbooru_cache_info.snapshot_date}"
+                if danbooru_cache_info is not None
+                else "未安装"
+            )
+            + "\n"
+            f"图片 Tagger: {'已安装' if tagger_info is not None else '未安装'}\n"
             f"当前画风: {selected_artist[0] if selected_artist else '原生'}\n"
             f"负面提示词: {negative_prompt or '未设置'}\n"
-            f"尺寸: {width}x{height}\n"
+            f"尺寸: {'自动' if size_mode == 'auto' else '固定'}"
+            f"（{width}x{height}）\n"
             f"Steps: {steps}\n"
             f"免费参数保护: {'通过' if free_eligible else '不通过'}"
         )
@@ -2317,6 +3148,49 @@ class NovelAIWebPlugin(star.Star):
 
         subcommand, separator, arguments = prompt_text.partition(" ")
         arguments = arguments.strip() if separator else ""
+        if subcommand == "更新词库":
+            try:
+                self._check_access(event)
+                if arguments:
+                    raise NovelAIWebError("用法：/nai 更新词库")
+                if not event.is_admin():
+                    raise NovelAIWebError("只有 AstrBot 管理员可以更新本地词库。")
+                cache_info = await update_danbooru_cache(self._danbooru_cache_path())
+            except (httpx.HTTPError, RuntimeError) as exc:
+                yield event.plain_result(f"本地词库更新失败：{exc}")
+                return
+            except NovelAIWebError as exc:
+                yield event.plain_result(str(exc))
+                return
+            yield event.plain_result(
+                f"本地 Danbooru 词库已更新：{cache_info.snapshot_date}，"
+                f"{cache_info.tag_count} 个标签，{cache_info.alias_count} 个别名。"
+            )
+            return
+
+        if subcommand.casefold() == "更新tagger":
+            try:
+                self._check_access(event)
+                if arguments:
+                    raise NovelAIWebError("用法：/nai 更新Tagger")
+                if not event.is_admin():
+                    raise NovelAIWebError("只有 AstrBot 管理员可以更新本地 Tagger。")
+                async with self._tagger_lock:
+                    tagger_info = await install_tagger_model(self._tagger_data_dir())
+                    self._local_image_tagger = None
+            except (httpx.HTTPError, RuntimeError, OSError) as exc:
+                yield event.plain_result(f"本地 Tagger 更新失败：{exc}")
+                return
+            except NovelAIWebError as exc:
+                yield event.plain_result(str(exc))
+                return
+            yield event.plain_result(
+                "本地 WD SwinV2 Tagger 已安装："
+                f"{tagger_info.model_bytes / 1024 / 1024:.1f} MiB，"
+                f"{tagger_info.label_count} 个候选标签。"
+            )
+            return
+
         if subcommand == "bug反馈":
             try:
                 self._check_access(event)
@@ -2500,9 +3374,16 @@ class NovelAIWebPlugin(star.Star):
         if subcommand == "切换大小":
             try:
                 self._check_access(event)
+                if arguments == "自动":
+                    await self._set_user_auto_size(event)
+                    yield event.plain_result(
+                        "你的生成大小已切换为自动；多人互动、宽场景会使用横图，"
+                        "头像或图标会使用方图，其余使用竖图。"
+                    )
+                    return
                 selected_size = GENERATION_SIZE_PRESETS.get(arguments)
                 if selected_size is None:
-                    raise NovelAIWebError("用法：/nai 切换大小 竖图|横图|方图")
+                    raise NovelAIWebError("用法：/nai 切换大小 自动|竖图|横图|方图")
                 width, height = await self._set_user_generation_size(
                     event,
                     *selected_size,
@@ -2541,8 +3422,13 @@ class NovelAIWebPlugin(star.Star):
                     character_prompts,
                     negative_prompt,
                     character_negative_prompts,
+                    previous_size,
                 ) = last_generation
-                generation_size = await self._user_generation_size(event)
+                generation_size = await self._user_generation_size(
+                    event,
+                    planned_prompt=prompt_text,
+                    previous_size=previous_size,
+                )
             except NovelAIWebError as exc:
                 yield event.plain_result(str(exc))
                 return
@@ -2564,6 +3450,7 @@ class NovelAIWebPlugin(star.Star):
                             character_prompts,
                             negative_prompt,
                             character_negative_prompts,
+                            generation_size,
                         )
                 except NovelAIWebError as exc:
                     yield event.plain_result(f"生成失败：{exc}")
@@ -2585,19 +3472,13 @@ class NovelAIWebPlugin(star.Star):
             )
             return
         prompt_text = arguments
-        prompt_parts = [part.strip() for part in prompt_text.split(",") if part.strip()]
-        is_direct_prompt = bool(NOVELAI_PROMPT_SIGNAL_PATTERN.search(prompt_text))
-        if not is_direct_prompt and len(prompt_parts) >= 2:
-            is_direct_prompt = all(
-                len(part) <= 120 and NOVELAI_ASCII_TAG_PATTERN.fullmatch(part)
-                for part in prompt_parts
-            )
 
         try:
             self._check_access(event)
+            reference_image_path = await self._reference_image_path(event)
             max_prompt_length = int(self.config.get("max_prompt_length", 4000))
-            if not prompt_text:
-                raise NovelAIWebError("用法：/nai 生成 <内容>")
+            if not prompt_text and reference_image_path is None:
+                raise NovelAIWebError("用法：/nai 生成 <内容> [附图]")
             if not 1 <= max_prompt_length <= 20_000:
                 raise NovelAIWebError("max_prompt_length 配置必须在 1 到 20000 之间。")
             if len(prompt_text) > max_prompt_length:
@@ -2622,19 +3503,50 @@ class NovelAIWebPlugin(star.Star):
                 raise NovelAIWebError(
                     "当前画师串与人物 Prompt 已占满 Prompt 长度上限。"
                 )
-            generation_size = await self._user_generation_size(event)
             negative_prompt = await self._user_negative_prompt(event)
         except NovelAIWebError as exc:
             yield event.plain_result(str(exc))
             return
 
+        prompt_parts = [part.strip() for part in prompt_text.split(",") if part.strip()]
+        is_direct_prompt = bool(NOVELAI_PROMPT_SIGNAL_PATTERN.search(prompt_text))
+        if not is_direct_prompt and len(prompt_parts) >= 2:
+            normalized_parts = [
+                part.translate(NOVELAI_TAG_CLASSIFICATION_TRANSLATION)
+                for part in prompt_parts
+            ]
+            tag_like_count = sum(
+                bool(len(part) <= 120 and NOVELAI_ASCII_TAG_PATTERN.fullmatch(part))
+                for part in normalized_parts
+            )
+            is_direct_prompt = tag_like_count == len(prompt_parts) or (
+                len(prompt_parts) >= 6 and tag_like_count * 5 >= len(prompt_parts) * 4
+            )
+        original_description = prompt_text
+
         await self._join_generation_queue()
         try:
             try:
                 async with self._generation_semaphore:
+                    reference_tags: tuple[str, ...] = ()
+                    if reference_image_path is not None:
+                        reference_tags = await self._tag_reference_image(
+                            reference_image_path
+                        )
                     if not is_direct_prompt:
+                        planning_description = prompt_text
+                        if reference_tags:
+                            user_instruction = prompt_text or "还原参考图片的可见内容"
+                            planning_description = (
+                                f"用户要求：{user_instruction}\n"
+                                "以下是本地图片 Tagger 从参考图识别出的可见证据。"
+                                "它可能有漏标或误标；以用户明确修改要求为最高优先级，"
+                                "保留其余可靠的主体、外观、服装、动作和构图：\n"
+                                f"<reference_image_tags>{', '.join(reference_tags)}"
+                                "</reference_image_tags>"
+                            )
                         plan = await self._plan_prompt(
-                            prompt_text,
+                            planning_description,
                             planner_max_length,
                             tuple(slot for slot, _, _, _ in character_replacements),
                         )
@@ -2645,6 +3557,8 @@ class NovelAIWebPlugin(star.Star):
                             ", ",
                             base_prompt,
                         ).strip(" ,")
+                        if reference_tags:
+                            base_prompt = ", ".join((*reference_tags, base_prompt))
                         plan = {
                             "prompt": base_prompt,
                             "character_prompts": {
@@ -2667,6 +3581,11 @@ class NovelAIWebPlugin(star.Star):
                         prompt_text,
                         character_prompts,
                     )
+                    generation_size = await self._user_generation_size(
+                        event,
+                        original_description,
+                        prompt_text,
+                    )
                     if selected_artist is not None:
                         prompt_text = f"{artist_content}, {prompt_text}"
                     if len(prompt_text) + sum(map(len, character_prompts)) > (
@@ -2688,6 +3607,7 @@ class NovelAIWebPlugin(star.Star):
                         character_prompts,
                         negative_prompt,
                         character_negative_prompts,
+                        generation_size,
                     )
             except NovelAIWebError as exc:
                 yield event.plain_result(f"生成失败：{exc}")
@@ -2799,7 +3719,7 @@ class NovelAIWebPlugin(star.Star):
                 "width": width,
                 "height": height,
                 "scale": 5,
-                "sampler": "k_euler_ancestral",
+                "sampler": "k_dpmpp_2m_sde",
                 "steps": steps,
                 "n_samples": 1,
                 "ucPreset": 0,
@@ -2812,7 +3732,7 @@ class NovelAIWebPlugin(star.Star):
                 "cfg_rescale": 0,
                 "noise_schedule": "karras",
                 "legacy_v3_extend": False,
-                "skip_cfg_above_sigma": None,
+                "skip_cfg_above_sigma": 58,
                 "use_coords": False,
                 "legacy_uc": False,
                 "normalize_reference_strength_multiple": True,
@@ -2835,8 +3755,8 @@ class NovelAIWebPlugin(star.Star):
                     "legacy_uc": False,
                 },
                 "negative_prompt": negative_prompt,
-                "deliberate_euler_ancestral_bug": False,
-                "prefer_brownian": True,
+                "deliberate_euler_ancestral_bug": True,
+                "prefer_brownian": False,
                 "image_format": "png",
                 "prompt": prompt,
             },
@@ -3116,7 +4036,8 @@ class NovelAIWebPlugin(star.Star):
         return output_path
 
     async def terminate(self) -> None:
-        """Close the reusable NovelAI HTTP client."""
+        """Release reusable NovelAI HTTP and local ONNX resources."""
         if self._api_client is not None:
             await self._api_client.aclose()
             self._api_client = None
+        self._local_image_tagger = None

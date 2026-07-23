@@ -40,6 +40,14 @@ services:
 
 自然语言 Prompt 规划还需要在 AstrBot 中配置一个可用的 LLM Provider，并把 `prompt_planner_provider_id` 改成该 Provider 的实际 ID。没有 DeepSeek Provider 时，可关闭 `prompt_planner_enabled`，现成 NovelAI 标签 Prompt 仍可直接生成。
 
+严格标签校验默认开启。管理员安装后先执行 `/nai 更新词库`，插件会下载一次约 3.3 MB 的每日 Danbooru 标签快照并转换成插件数据目录内的 SQLite；之后每次生成只查本地数据库，不会逐请求访问 Danbooru。需要让 QQ 附图参与 Prompt 规划时，再执行 `/nai 更新Tagger` 显式下载约 470 MB 的 WD SwinV2 ONNX 模型。Tagger 在 CPU 上按需加载并复用，不会加载本机 Qwen 或 CLIP。
+
+图片反推模型固定到 Apache-2.0 的 [`SmilingWolf/wd-swinv2-tagger-v3`](https://huggingface.co/SmilingWolf/wd-swinv2-tagger-v3) 发布版本；它支持 general、character 与 rating 分类，插件只保留 general/character 结果并再次通过本地 Danbooru SQLite 过滤。模型文件属于上游项目，不会随本插件仓库分发。
+
+Tagger 默认使用 `0.30` 的 general 阈值和 `0.85` 的 character 阈值。ONNX Runtime 固定为单会话、顺序执行、4 个算子线程和 1 个图间线程，以避免自动线程池在长期 Bot 进程中产生延迟尖峰；`requirements.txt` 会安装 Pillow、NumPy 与 ONNX Runtime，但模型仍需管理员执行 `/nai 更新Tagger` 后单独下载。
+
+仓库内的 [`prompt-planner`](prompt-planner) 是同一套 Prompt Skill 的独立 CLI/HTTP 版本。它可以使用单独的 DeepSeek API Key 运行，不依赖 AstrBot、NapCat、QQ 或 NovelAI 凭据；当前插件尚未改为强制依赖该服务。
+
 ## 权限
 
 - 私聊 `/nai`、`/nai_status` 只允许 `allowed_sender_ids` 中的 QQ。
@@ -54,6 +62,7 @@ services:
 /nai help
 /nai_status
 /nai 生成 一位银发蓝眼的成年女性站在雪夜街道，半身，冷色背光
+/nai 生成 把参考图改成手机自拍风格  # 同条消息附图，或回复一张图
 /nai 重抽
 /nai bug反馈 <问题描述>
 /nai 切换画师串 <串名称>|默认|原生
@@ -67,21 +76,26 @@ services:
 /nai 确认
 /nai 人物
 /nai 人物 霜音
+/nai 切换大小 自动
 /nai 切换大小 竖图
 /nai 切换大小 横图
 /nai 切换大小 方图
 /nai 自定义大小 768x1024
+/nai 更新词库              # 管理员
+/nai 更新Tagger            # 管理员，首次约 470 MB
 ```
 
 画师串库按群保存并保存在插件数据目录的 `artist_strings.json`，同群成员可以添加、查看、覆盖和使用同一个库。当前画师串按“群号 + QQ 号”绑定，因此成员之间、不同群之间都不会互相切换。未选择时自动使用全局默认的 `千代noob` 快照；`/nai 切换画师串 默认` 恢复该全局默认，`/nai 切换画师串 原生` 才是不添加画师串。生成尺寸仍按 QQ 号保存。
 
-`/nai 生成` 会自动区分输入类型：自然语言描述由独立的 `deepseek/deepseek-v4-flash` 规划为 NovelAI V4.5 Prompt；已经包含标签列表、画师字段、权重语法、下划线标签或 `1girl` 等特征的 Prompt 会跳过 DeepSeek 并原样直通。规划调用不带群聊历史，并严格返回 JSON；插件会拒绝无效 JSON、画师字段和多角色编辑器字段。规划器不会要求用户补充年龄或擅自添加 adult。规划完成后，插件才把当前群画师串或全局默认画师串作为前缀拼接；显式选择原生画风时不添加前缀。
+`/nai 生成` 会自动区分输入类型：自然语言描述由独立的 `deepseek/deepseek-v4-flash` 规划为 NovelAI V4.5 Prompt；已经包含标签列表、画师字段、权重语法、下划线标签或 `1girl` 等特征的纯文本 Prompt 会跳过 DeepSeek 并原样直通。规划调用不带群聊历史，并严格返回 JSON；插件会拒绝无效 JSON、画师字段、多角色编辑器字段、自然语言伪 tag，以及本地 SQLite 中不存在、作品数过低或属于画师分类的标签。规划器不会要求用户补充年龄或擅自添加 adult。规划完成后，插件才把当前群画师串或全局默认画师串作为前缀拼接；显式选择原生画风时不添加前缀。
+
+`/nai 生成 <要求>` 可以在同一条 QQ 消息附一张图，也可以回复一张图。插件只接受一张参考图，先由本地 WD SwinV2 Tagger 反推出 Danbooru tags，再经本地词库过滤；自然语言要求会让 DeepSeek 以“用户修改优先、Tagger 结果为可见证据”的方式重新规划。若用户提供的是现成标签 Prompt，则参考图 tags 会作为前缀直接合并，原标签部分不交给 DeepSeek。图片不会上传给 DeepSeek，也不会作为 Img2Img、Vibe 或 Precise Reference 发送给 NovelAI。
 
 当“画师/画家”是画面人物而不是风格名称时，插件会校验并补齐绘画动作、画笔、画布和画架等职业视觉锚点，避免模型只输出 `painter` 或 `beret`。用户明确要求不作画、空手或不带画具时不会强制补齐。
 
-规划器默认使用通用语义展开：简短输入也会围绕主体补全动作或姿态、表情或视线、镜头或构图、环境或道具以及光照氛围。人物库 Prompt 仍由占位符保护，不会被 DeepSeek 改写；补全只发生在人物的本次画面表现上。
+规划器使用内容优先的分级扩写：简短输入优先补全主体、服装结构、材质、配色、装饰、动作和表情；具体输入以精确保留为主。镜头、背景和复杂光影只在用户提出或动作成立需要时加入，避免自动场景套餐稀释角色设计。人物库 Prompt 仍由占位符保护，不会被 DeepSeek 改写；补全只发生在人物的本次画面表现上。API 已启用 NovelAI Quality Tags，因此规划器不重复生成质量词。
 
-Q版/chibi 等强视觉模式使用精简扩写。Q版请求会确定性保留 `chibi, super deformed`，并抑制自动产生的写实比例与摄影标签，避免普通补全逻辑稀释 Q版造型。
+Q版/chibi 等强视觉模式使用精简扩写。Q版请求会确定性保留现行标签 `chibi`，移除旧别名 `super deformed`，并抑制自动产生的写实比例与摄影标签，避免普通补全逻辑稀释 Q版造型。
 
 `/nai 重抽` 按“群号 + QQ 号”读取上一次成功提交给 NovelAI 的完整 Prompt，跳过 DeepSeek 并原样重新生成。记录包含当时已经拼接的画师串和人物 Prompt，失败请求不会覆盖记录；尺寸使用该用户执行重抽时的当前设置。
 
@@ -93,7 +107,7 @@ Q版/chibi 等强视觉模式使用精简扩写。Q版请求会确定性保留 `
 
 创建新人物会立即保存。重复提交同名人物时不会立刻覆盖，而是暂存本次新 Prompt，并提示在 60 秒内发送 `/nai 确认`；确认按“群号 + QQ 号”隔离，只能由发起者在原群完成。超时、AstrBot 重启或发起者提交新的创建请求后，旧确认状态失效。确认前若该人物已被其他成员修改，本次确认也会失效，避免覆盖更新后的内容。
 
-生成描述命中已保存角色名时，插件先把名字替换为受保护的 `__NAI_CHARACTER_SLOT_数字__`。DeepSeek 只能围绕槽位规划动作、互动、镜头、环境和光照，并必须原样返回每个槽位一次；插件校验后才把人物 Prompt 原样插回。人物库内容不会发送给 DeepSeek，也不会被翻译、删减、重新加权。默认单次最多命中 4 个不同人物。
+生成描述命中已保存角色名时，插件先把名字替换为受保护的 `__NAI_CHARACTER_SLOT_数字__`。DeepSeek 只能围绕槽位规划动作、互动、表情和姿势，并必须把每个槽位原样作为 `character_prompts` 的键返回一次；插件校验后才把人物库 Prompt 与本次动态 Prompt 合并为 NovelAI V4 原生 character captions。人物库内容不会发送给 DeepSeek，也不会被翻译、删减或重新加权。默认单次最多命中 4 个不同人物。
 
 规划模型的规范位于 `skills/novelai-prompt-planner`。`prompt_planner_enabled=false` 可恢复原样提交；`prompt_planner_provider_id` 可切换独立规划 Provider。当前默认使用 Flash，以降低 QQ 指令等待时间。即使 NovelAI API 生成是 0 Anlas，DeepSeek Prompt 规划仍按 DeepSeek API 计费。
 
@@ -101,7 +115,7 @@ Q版/chibi 等强视觉模式使用精简扩写。Q版请求会确定性保留 `
 
 专用绘图 Bot 建议关闭 AstrBot `provider_settings.enable` 和空白 @ 等待回复。插件通过 `context.llm_generate()` 直接调用配置的 Prompt 规划 Provider，因此关闭默认聊天链路不会关闭 DeepSeek Prompt 规划。`/nai生成`、`/naihelp` 等缺少分隔空格的格式会被插件拦截并返回一行用法提示，不会落入默认聊天模型。
 
-大小预设对应 NovelAI NORMAL Portrait `832x1216`、Landscape `1216x832` 和 Square `1024x1024`。自定义宽高必须是 64 的倍数、分别位于 64 到 2048 之间，且总像素不得超过 `1024x1024`。插件把当前用户保存的尺寸直接写入每次 API 请求，因此不同 QQ 用户不会互相沿用尺寸。
+大小预设对应 NovelAI NORMAL Portrait `832x1216`、Landscape `1216x832` 和 Square `1024x1024`。新用户默认使用自动模式：多人互动、宽场景、追逐或车辆等使用横图，头像、图标、贴纸或 Q 版等紧凑主体使用方图，其余回退竖图；同一请求始终只映射到这三个受保护预设。`/nai 切换大小 竖图|横图|方图` 和 `/nai 自定义大小` 会锁定尺寸，`/nai 切换大小 自动` 恢复自动。自定义宽高必须是 64 的倍数、分别位于 64 到 2048 之间，且总像素不得超过 `1024x1024`。不同 QQ 用户不会互相沿用尺寸。
 
 所有成员执行 `/nai help` 时都会在当前会话显示普通指令。管理员还会额外通过 QQ 私聊收到仅管理员指令。
 
