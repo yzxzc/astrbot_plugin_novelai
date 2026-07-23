@@ -36,7 +36,7 @@
   "steps": {
     "description": "NovelAI API 生成 Steps",
     "type": "int",
-    "default": 23,
+    "default": 28,
     "hint": "Opus 免费生成不得超过 max_steps。"
   },
   "negative_prompt": {

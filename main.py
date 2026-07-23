@@ -56,7 +56,7 @@ NOVELAI_IMAGE_ENDPOINT = "/ai/generate-image"
 NOVELAI_SUBSCRIPTION_ENDPOINT = "/user/subscription"
 NOVELAI_MODEL = "nai-diffusion-4-5-full"
 NOVELAI_PAT_ENV = "NOVELAI_API_TOKEN"
-DEFAULT_STEPS = 23
+DEFAULT_STEPS = 28
 DEFAULT_NEGATIVE_PROMPT = ""
 DEFAULT_PROMPT_PLANNER_PROVIDER_ID = "deepseek/deepseek-v4-flash"
 DEFAULT_DANBOORU_MIN_POST_COUNT = 50
@@ -3719,7 +3719,7 @@ class NovelAIWebPlugin(star.Star):
                 "width": width,
                 "height": height,
                 "scale": 5,
-                "sampler": "k_euler_ancestral",
+                "sampler": "k_dpmpp_2m_sde",
                 "steps": steps,
                 "n_samples": 1,
                 "ucPreset": 0,
@@ -3732,7 +3732,7 @@ class NovelAIWebPlugin(star.Star):
                 "cfg_rescale": 0,
                 "noise_schedule": "karras",
                 "legacy_v3_extend": False,
-                "skip_cfg_above_sigma": None,
+                "skip_cfg_above_sigma": 58,
                 "use_coords": False,
                 "legacy_uc": False,
                 "normalize_reference_strength_multiple": True,
@@ -3755,8 +3755,8 @@ class NovelAIWebPlugin(star.Star):
                     "legacy_uc": False,
                 },
                 "negative_prompt": negative_prompt,
-                "deliberate_euler_ancestral_bug": False,
-                "prefer_brownian": True,
+                "deliberate_euler_ancestral_bug": True,
+                "prefer_brownian": False,
                 "image_format": "png",
                 "prompt": prompt,
             },

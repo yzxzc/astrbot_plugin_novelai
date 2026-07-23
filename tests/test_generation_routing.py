@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import json
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -284,6 +285,69 @@ async def test_api_failure_only_returns_error() -> None:
     ]
 
     assert results == [("plain", "生成失败：API unavailable")]
+
+
+@pytest.mark.asyncio
+async def test_api_payload_uses_requested_default_generation_preset() -> None:
+    """Match the requested NovelAI web generation settings."""
+    captured_payload: dict[str, object] = {}
+
+    async def response_bytes():
+        """Yield one bounded fake response body.
+
+        Yields:
+            One fake image byte chunk.
+        """
+        yield b"fake-image"
+
+    response = SimpleNamespace(
+        status_code=200,
+        headers={"content-type": "application/zip"},
+        aiter_bytes=response_bytes,
+    )
+
+    @asynccontextmanager
+    async def fake_stream(*_args, **kwargs):
+        """Capture one request and expose the fake streaming response.
+
+        Args:
+            *_args: Positional request arguments ignored by the fake.
+            **kwargs: Keyword request arguments containing the JSON payload.
+
+        Yields:
+            Fake successful streaming response.
+        """
+        captured_payload.update(kwargs["json"])
+        yield response
+
+    client = Mock()
+    client.stream = Mock(side_effect=fake_stream)
+    plugin = MODULE.NovelAIWebPlugin.__new__(MODULE.NovelAIWebPlugin)
+    plugin.config = {
+        "max_total_pixels": 1_048_576,
+        "max_steps": 28,
+        "timeout_seconds": 180,
+        "max_response_bytes": 16 * 1024 * 1024,
+    }
+    plugin._read_subscription = AsyncMock(return_value={"active": True, "tier": 3})
+    plugin._get_api_client = Mock(return_value=client)
+    plugin._extract_image_from_response = Mock(return_value=b"fake-image")
+    plugin._image_dimensions = Mock(return_value=(832, 1216))
+    plugin._validate_and_save_image = Mock(return_value=Path("generated.png"))
+
+    result = await plugin._generate_from_api("1girl, solo", (832, 1216))
+
+    parameters = captured_payload["parameters"]
+    assert isinstance(parameters, dict)
+    assert parameters["steps"] == 28
+    assert parameters["scale"] == 5
+    assert parameters["sampler"] == "k_dpmpp_2m_sde"
+    assert parameters["cfg_rescale"] == 0
+    assert parameters["noise_schedule"] == "karras"
+    assert parameters["skip_cfg_above_sigma"] == 58
+    assert parameters["deliberate_euler_ancestral_bug"] is True
+    assert parameters["prefer_brownian"] is False
+    assert result == Path("generated.png")
 
 
 @pytest.mark.asyncio
